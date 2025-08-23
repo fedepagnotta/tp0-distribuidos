@@ -11,17 +11,7 @@ touch $docker_compose_file
 echo "
 name: tp0
 services:
-  server:
-    container_name: server
-    image: server:latest
-    entrypoint: python3 /main.py
-    environment:
-      - PYTHONUNBUFFERED=1
-      - LOGGING_LEVEL=DEBUG
-    networks:
-      - testing_net
-
-  client1:
+  tester:
     container_name: tester
     image: tester:latest
     environment:
@@ -29,8 +19,6 @@ services:
       - CLI_LOG_LEVEL=DEBUG
     networks:
       - testing_net
-    depends_on:
-      - server
 
 networks:
   testing_net:
@@ -46,7 +34,6 @@ FROM alpine:latest
 RUN apk add --no-cache netcat-openbsd
 CMD [\"sleep\", \"infinity\"]" > $dockerfile
 
-docker build -f ./server/Dockerfile -t "server:latest" . > /dev/null 2>&1
 docker build -f $dockerfile -t "tester:latest" . > /dev/null 2>&1
 docker compose -f $docker_compose_file up -d --build > /dev/null 2>&1
 
