@@ -14,7 +14,9 @@ services:
       - PYTHONUNBUFFERED=1
       - LOGGING_LEVEL=DEBUG
     networks:
-      - testing_net" > $1
+      - testing_net
+    volumes:
+      - ./server/config.ini:/config.ini:ro" > $1
 
 for i in $(seq 1 $2); do
     echo "
@@ -28,7 +30,9 @@ for i in $(seq 1 $2); do
     networks:
       - testing_net
     depends_on:
-      - server" >> $1
+      - server
+    volumes:
+      - ./client/config.yaml:/config.yaml:ro" >> $1
 done
 
 echo "
