@@ -37,12 +37,6 @@ CMD [\"sleep\", \"infinity\"]" > $dockerfile
 docker build -f $dockerfile -t "tester:latest" . > /dev/null 2>&1
 docker compose -f $docker_compose_file up -d --build > /dev/null 2>&1
 
-for i in {1..20}; do
-  state=$(docker inspect -f '{{.State.Status}}' tester || true)
-  if [ "$state" = "running" ]; then break; fi
-  sleep 0.3
-done
-
 respuesta=$(docker exec -i tester sh -c "echo 'test_msg_$timestamp' | timeout 10 nc $server_ip $server_port")
 
 docker compose -f $docker_compose_file stop -t 1 > /dev/null 2>&1
