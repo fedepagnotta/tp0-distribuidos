@@ -32,7 +32,6 @@ class Server:
                 if not self._running:
                     break
                 raise
-        logging.info("action: receive_sigterm | result: graceful_shutdown")
         self._running = False
         logging.shutdown()
 
