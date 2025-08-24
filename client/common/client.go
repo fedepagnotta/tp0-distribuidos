@@ -63,7 +63,6 @@ func (c *Client) StartClientLoop() {
 	for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
 		select {
 		case <-ctx.Done():
-			log.Info("action: receive_sigterm | result: graceful_shutdown")
 			return
 		default:
 		}
@@ -89,7 +88,6 @@ func (c *Client) StartClientLoop() {
 		timer := time.NewTimer(c.config.LoopPeriod)
 		select {
 		case <-ctx.Done():
-			log.Info("action: receive_sigterm | result: graceful_shutdown")
 			_ = c.conn.SetReadDeadline(time.Now())
 			<-readDone
 			timer.Stop()
@@ -98,7 +96,6 @@ func (c *Client) StartClientLoop() {
 		case <-timer.C:
 			select {
 			case <-ctx.Done():
-				log.Info("action: receive_sigterm | result: graceful_shutdown")
 				_ = c.conn.SetReadDeadline(time.Now())
 				<-readDone
 				timer.Stop()
