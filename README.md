@@ -237,3 +237,89 @@ Versión final de `__stop_running()`:
         self._running = False
         self._server_socket.close()
 ```
+
+#### Client
+
+Se utilizó un `context` creado con `signal.NotifyContext`, para "bypassear" el comportamiento por defecto de Go a la hora de recibir señales `SIGTERM`. En otras palabras,
+`signal.NotifyContext` convierte `SIGTERM` en cancelación de contexto, lo que permite handlear la interrupción, limpiando lo necesario y terminando de forma ordenada.
+
+Este contexto se creó en la función `StartClientLoop`. Seguido de esto, se utilizó `defer stop()` para posponer la interrupción del programa hasta que la función
+retorne. De esta forma, se puede handlear la señal, hacer un `graceful shutdown`, y finalmente terminar la ejecución.
+
+El loop de `StartClientLoop` fue modificado, quedando así:
+
+```go
+for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
+    select {
+    case <-ctx.Done():
+        return
+    default:
+    }
+    // Create the connection the server in every loop iteration. Send an
+    c.createClientSocket()
+
+    // TODO: Modify the send to avoid short-write
+    fmt.Fprintf(
+        c.conn,
+        "[CLIENT %v] Message N°%v\n",
+        c.config.ID,
+        msgID,
+    )
+
+    readDone := make(chan struct{})
+    var msg string
+    var err error
+    go func() {
+        msg, err = bufio.NewReader(c.conn).ReadString('\n')
+        close(readDone)
+    }()
+
+    timer := time.NewTimer(c.config.LoopPeriod)
+    select {
+    case <-ctx.Done():
+        _ = c.conn.SetReadDeadline(time.Now())
+        <-readDone
+        timer.Stop()
+        c.conn.Close()
+        return
+    case <-timer.C:
+        select {
+        case <-ctx.Done():
+            _ = c.conn.SetReadDeadline(time.Now())
+            <-readDone
+            timer.Stop()
+            c.conn.Close()
+            return
+        case <-readDone:
+            c.conn.Close()
+            if err != nil {
+                log.Errorf("action: receive_message | result: fail | client_id: %v | error: %v",
+                    c.config.ID,
+                    err,
+                )
+                return
+            }
+            log.Infof("action: receive_message | result: success | client_id: %v | msg: %v",
+                c.config.ID,
+                msg,
+            )
+        }
+    }
+}
+```
+
+Veámoslo en detalle:
+
+1. Al principio de cada iteración se agregó un chequeo, para ver si la señal ya había sido notificada en el contexto.
+2. La lectura del buffer se pasó a una `goroutine`, que cierra un canal `readDone` al finalizar la lectura.
+3. En vez de hacer un `sleep` para separar los envíos del cliente, se utilizó un `timer`, y luego, utilizando un `select`, la main routine quedó bloqueada
+   esperando la señal del contexto (el `SIGTERM`), o la señal del timer (la finalización del `LoopPeriod` seteado en el archivo de configuración).
+
+- Si lo primero en suceder es que llega el `SIGTERM`, se setea un deadline para la operación de lectura que estaba realizando la goroutine, haciendo que se interrumpa
+  la misma. Luego, se espera a que se cierre el canal `readDone` para frenar el `timer`, cerrar el `socket` del cliente, y retornar para ejecutar el `stop()` del `defer`.
+- Si lo primero en suceder es que se termina el timer, se vuelve a hacer un `select`, esta vez esperando al `SIGTERM` o a que se finalice la lectura de la `goroutine`.
+  Si llega el `SIGTERM` primero, se ejecuta el flujo mencionado justo arriba. En caso contrario, simplemente se cierra el socket de la iteración actual, y se loggea el
+  resultado correspondiente.
+
+De esta forma, tanto la lectura como la espera entre envíos al servidor son interrumpibles de forma ordenada, y se puede realizar un `graceful shutdown` al recibir un
+`SIGTERM`.
