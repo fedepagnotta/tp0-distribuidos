@@ -20,8 +20,6 @@ class Server:
         finishes, servers starts to accept new connections again
         """
 
-        # TODO: Modify this program to handle signal to graceful shutdown
-        # the server
         self._running = True
         signal.signal(signal.SIGTERM, self.__stop_running)
         while self._running:
@@ -32,7 +30,6 @@ class Server:
                 if not self._running:
                     break
                 raise
-        self._running = False
         logging.shutdown()
 
     def __handle_client_connection(self, client_sock):
