@@ -331,7 +331,7 @@ De esta forma, tanto la lectura como la espera entre envíos al servidor son int
 El protocolo de comunicación utilizado se basa en envío de paquetes con ordenamiento little endian y el siguiente formato:
 
 | opcode | length | body |
-0........1........9......9 + length
+0........1........5......5 + length
 
 Para describir el formato del cuerpo de los paquetes, utilizaremos la siguiente notación (basada en el protocolo nativo de Cassandra):
 
