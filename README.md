@@ -323,3 +323,32 @@ Veámoslo en detalle:
 
 De esta forma, tanto la lectura como la espera entre envíos al servidor son interrumpibles de forma ordenada, y se puede realizar un `graceful shutdown` al recibir un
 `SIGTERM`.
+
+### Ejercicio N°5:
+
+#### Protocolo
+
+El protocolo de comunicación utilizado se basa en envío de paquetes con ordenamiento little endian y el siguiente formato:
+
+| opcode | length | body |
+0........1........9......9 + length
+
+Para describir el formato del cuerpo de los paquetes, utilizaremos la siguiente notación (basada en el protocolo nativo de Cassandra):
+
+- [int]: Un entero de 4 bytes.
+- [string]: Un n de tipo [int], seguido de n bytes representando un string UTF-8.
+- [string map]: Un n de tipo [int], seguido de n pares <k><v> donde <k> y <v> son [string].
+- [multi string map]: Un n de tipo [int], seguido de n [string map].
+
+Como se puede observar, el campo `opcode` es el primer byte del paquete, y puede tomar los siguientes valores:
+
+- 0: _NEW_BETS_. Es enviado por el cliente, y representa un conjunto de apuestas. Es el único mensaje que tiene un body, y éste es un [multi string map]. En este ejercicio
+  este [multi string map] va a tener tamaño fijo 1, pero se utiliza este formato para favorecer escalabilidad a futuro y facilitar la implementación de envío
+  de bets por batches. Dado que la única diferencia entre un [string map] y un [multi string map] de tamaño 1 son 4 bytes, se considera que el trade off es
+  positivo, y vale la pena simplificar implementaciones futuras en desmero de la ligereza de los paquetes, ya que la diferencia de tamaño en bytes es muy pequeña.
+
+- 1: _BETS_RECV_SUCCESS_. Es enviado por el server en respuesta al cliente si pudo procesar con éxito todas las apuestas.
+
+- 2: _BETS_RECV_FAIL_. Es enviado por el server en respuesta al cliente si hubo un error al procesar alguna de las apuestas.
+
+Por último, el campo `length` indica la longitud total en bytes del body.
