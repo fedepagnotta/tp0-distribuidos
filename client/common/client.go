@@ -3,7 +3,6 @@ package common
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"net"
 	"os/signal"
 	"syscall"
@@ -18,8 +17,6 @@ var log = logging.MustGetLogger("log")
 type ClientConfig struct {
 	ID            string
 	ServerAddress string
-	LoopAmount    int
-	LoopPeriod    time.Duration
 }
 
 // Client Entity that encapsulates how
@@ -48,74 +45,66 @@ func (c *Client) createClientSocket() error {
 			c.config.ID,
 			err,
 		)
+		return err
 	}
 	c.conn = conn
 	return nil
 }
 
-// StartClientLoop Send messages to the client until some time threshold is met
-func (c *Client) StartClientLoop() {
+// SendBet Sends messages to the client until some time threshold is met
+func (c *Client) SendBet(name string, lastName string, dni string, birthDate string, number string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
 
-	// There is an autoincremental msgID to identify every message sent
-	// Messages if the message amount threshold has not been surpassed
-	for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		// Create the connection the server in every loop iteration. Send an
-		c.createClientSocket()
-
-		// TODO: Modify the send to avoid short-write
-		fmt.Fprintf(
-			c.conn,
-			"[CLIENT %v] Message N°%v\n",
-			c.config.ID,
-			msgID,
-		)
-
-		readDone := make(chan struct{})
-		var msg string
-		var err error
-		go func() {
-			msg, err = bufio.NewReader(c.conn).ReadString('\n')
-			close(readDone)
-		}()
-
-		timer := time.NewTimer(c.config.LoopPeriod)
-		select {
-		case <-ctx.Done():
-			_ = c.conn.SetReadDeadline(time.Now())
-			<-readDone
-			timer.Stop()
-			c.conn.Close()
-			return
-		case <-timer.C:
-			select {
-			case <-ctx.Done():
-				_ = c.conn.SetReadDeadline(time.Now())
-				<-readDone
-				timer.Stop()
-				c.conn.Close()
-				return
-			case <-readDone:
-				c.conn.Close()
-				if err != nil {
-					log.Errorf("action: receive_message | result: fail | client_id: %v | error: %v",
-						c.config.ID,
-						err,
-					)
-					return
-				}
-				log.Infof("action: receive_message | result: success | client_id: %v | msg: %v",
-					c.config.ID,
-					msg,
-				)
-			}
-		}
+	select {
+	case <-ctx.Done():
+		return
+	default:
 	}
-	log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
+
+	if err := c.createClientSocket(); err != nil {
+		return
+	}
+
+	reader := bufio.NewReader(c.conn)
+
+	bets := NewBets{
+		Bets: []map[string]string{
+			{
+				"NOMBRE":     name,
+				"APELLIDO":   lastName,
+				"DOCUMENTO":  dni,
+				"NACIMIENTO": birthDate,
+				"NUMERO":     number,
+			},
+		},
+	}
+	if _, err := bets.WriteTo(c.conn); err != nil {
+		log.Errorf("action: apuesta_enviada | result: fail | dni: %s | numero: %s", dni, number)
+		_ = c.conn.Close()
+		return
+	}
+
+	readDone := make(chan struct{})
+	var msg Readable
+	var err error
+	go func() {
+		msg, err = ReadMessage(reader)
+		close(readDone)
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = c.conn.SetReadDeadline(time.Now())
+		<-readDone
+		c.conn.Close()
+		return
+	case <-readDone:
+		c.conn.Close()
+		if err != nil || msg.GetOpCode() == BetsRecvFailOpCode {
+			log.Errorf("action: apuesta_enviada | result: fail | dni: %s | numero: %s", dni, number)
+			return
+		}
+		log.Infof("action: apuesta_enviada | result: success | dni: %s | numero: %s", dni, number)
+	}
 }
