@@ -94,10 +94,12 @@ func main() {
 	v, err := InitConfig()
 	if err != nil {
 		log.Criticalf("%s", err)
+		return
 	}
 
 	if err := InitLogger(v.GetString("log.level")); err != nil {
 		log.Criticalf("%s", err)
+		return
 	}
 
 	// Print program config with debugging purposes
@@ -106,10 +108,19 @@ func main() {
 	clientConfig := common.ClientConfig{
 		ServerAddress: v.GetString("server.address"),
 		ID:            v.GetString("id"),
-		LoopAmount:    v.GetInt("loop.amount"),
-		LoopPeriod:    v.GetDuration("loop.period"),
 	}
 
 	client := common.NewClient(clientConfig)
-	client.StartClientLoop()
+
+	name, nameExists := os.LookupEnv("NOMBRE")
+	lastName, lastNameExists := os.LookupEnv("APELLIDO")
+	dni, dniExists := os.LookupEnv("DOCUMENTO")
+	birthDate, birthDateExists := os.LookupEnv("NACIMIENTO")
+	number, numberExists := os.LookupEnv("NUMERO")
+	if !nameExists || !lastNameExists || !dniExists || !birthDateExists || !numberExists {
+		log.Critical("env variables missing")
+		return
+	}
+
+	client.SendBet(name, lastName, dni, birthDate, number)
 }
