@@ -22,6 +22,10 @@ func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("protocol error: %s (opcode=%d)", e.Msg, e.Opcode)
 }
 
+type Message interface {
+	GetOpCode() byte
+}
+
 type Writeable interface {
 	// writes contents to out following the package format (opcode, length, body)
 	// returns the total length of the body, or error if the write failed
@@ -61,16 +65,20 @@ type NewBets struct {
 	Bets []map[string]string
 }
 
-func (b NewBets) WriteTo(out net.Conn) (int, error) {
+func (msg *NewBets) GetOpCode() byte {
+	return NewBetsOpCode
+}
+
+func (msg *NewBets) WriteTo(out net.Conn) (int, error) {
 	var buff bytes.Buffer
 	if err := buff.WriteByte(NewBetsOpCode); err != nil {
 		return 0, err
 	}
 	var bodyBuff bytes.Buffer
-	if err := binary.Write(&bodyBuff, binary.LittleEndian, int32(len(b.Bets))); err != nil {
+	if err := binary.Write(&bodyBuff, binary.LittleEndian, int32(len(msg.Bets))); err != nil {
 		return 0, err
 	}
-	if err := writeMultiStringMap(&bodyBuff, b.Bets); err != nil {
+	if err := writeMultiStringMap(&bodyBuff, msg.Bets); err != nil {
 		return 0, err
 	}
 	if err := binary.Write(&buff, binary.LittleEndian, int32(bodyBuff.Len())); err != nil {
@@ -89,9 +97,14 @@ func (b NewBets) WriteTo(out net.Conn) (int, error) {
 
 type Readable interface {
 	readFrom(reader *bufio.Reader) (Readable, error)
+	Message
 }
 
 type BetsRecvSuccess struct{}
+
+func (msg *BetsRecvSuccess) GetOpCode() byte {
+	return BetsRecvSuccessOpCode
+}
 
 func (msg *BetsRecvSuccess) readFrom(reader *bufio.Reader) (Readable, error) {
 	var length int32
@@ -105,6 +118,10 @@ func (msg *BetsRecvSuccess) readFrom(reader *bufio.Reader) (Readable, error) {
 }
 
 type BetsRecvFail struct{}
+
+func (msg *BetsRecvFail) GetOpCode() byte {
+	return BetsRecvFailOpCode
+}
 
 func (msg *BetsRecvFail) readFrom(reader *bufio.Reader) (Readable, error) {
 	var length int32
