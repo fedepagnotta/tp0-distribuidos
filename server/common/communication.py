@@ -141,13 +141,12 @@ def recv_msg(sock: socket.socket):
     (length, _) = read_i32(sock, 4, -1)
     if length < 0:
         raise ProtocolError("invalid length")
-    match opcode:
-        case Opcodes.NEW_BETS:
-            new_bets = NewBets()
-            new_bets.read_from(sock, length)
-            return new_bets
-        case _:
-            raise ProtocolError(f"invalid opcode: {opcode}")
+    if opcode == Opcodes.NEW_BETS:
+        new_bets = NewBets()
+        new_bets.read_from(sock, length)
+        return new_bets
+    else:
+        raise ProtocolError(f"invalid opcode: {opcode}")
 
 
 def write_struct(sock: socket.socket, fmt: str, *values) -> None:
