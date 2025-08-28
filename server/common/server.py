@@ -2,6 +2,8 @@ import logging
 import signal
 import socket
 
+from common import communication, utils
+
 
 class Server:
     def __init__(self, port, listen_backlog):
@@ -19,7 +21,6 @@ class Server:
         communication with a client. After client with communucation
         finishes, servers starts to accept new connections again
         """
-
         self._running = True
         signal.signal(signal.SIGTERM, self.__stop_running)
         while self._running:
@@ -40,16 +41,21 @@ class Server:
         client socket will also be closed
         """
         try:
-            # TODO: Modify the receive to avoid short-reads
-            msg = client_sock.recv(1024).rstrip().decode("utf-8")
+            msg = communication.recv_msg(client_sock)
             addr = client_sock.getpeername()
             logging.info(
                 f"action: receive_message | result: success | ip: {addr[0]} | msg: {msg}"
             )
-            # TODO: Modify the send to avoid short-writes
-            client_sock.send("{}\n".format(msg).encode("utf-8"))
-        except OSError as e:
-            logging.error("action: receive_message | result: fail | error: {e}")
+            response = communication.BetsRecvSuccess()
+            response.write_to(client_sock)
+            msg.process()
+        except (EOFError, communication.ProtocolError) as e:
+            logging.error("action: receive_message | result: fail | error: %s", e)
+            response = communication.BetsRecvFail()
+            try:
+                response.write_to(client_sock)
+            except communication.ProtocolError as e1:
+                logging.error("action: send_message | result: fail | error: %s", e1)
         finally:
             client_sock.close()
 
@@ -60,13 +66,12 @@ class Server:
         Function blocks until a connection to a client is made.
         Then connection created is printed and returned
         """
-
         # Connection arrived
         logging.info("action: accept_connections | result: in_progress")
         c, addr = self._server_socket.accept()
         logging.info(f"action: accept_connections | result: success | ip: {addr[0]}")
         return c
 
-    def __stop_running(self, signum, frame):
+    def __stop_running(self, _signum, _frame):
         self._running = False
         self._server_socket.close()
