@@ -71,6 +71,7 @@ func (c *Client) SendBet(name string, lastName string, dni string, birthDate str
 	bets := NewBets{
 		Bets: []map[string]string{
 			{
+				"AGENCIA":    c.config.ID,
 				"NOMBRE":     name,
 				"APELLIDO":   lastName,
 				"DOCUMENTO":  dni,
