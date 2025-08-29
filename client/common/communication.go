@@ -46,15 +46,22 @@ func writePair(buff *bytes.Buffer, k string, v string) error {
 	return writeString(buff, v)
 }
 
-func writeMultiStringMap(buff *bytes.Buffer, body []map[string]string) error {
-	for _, m := range body {
-		if err := binary.Write(buff, binary.LittleEndian, int32(len(m))); err != nil {
+func writeStringMap(buff *bytes.Buffer, body map[string]string) error {
+	if err := binary.Write(buff, binary.LittleEndian, int32(len(body))); err != nil {
+		return err
+	}
+	for k, v := range body {
+		if err := writePair(buff, k, v); err != nil {
 			return err
 		}
-		for k, v := range m {
-			if err := writePair(buff, k, v); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+func writeMultiStringMap(buff *bytes.Buffer, body []map[string]string) error {
+	for _, m := range body {
+		if err := writeStringMap(buff, m); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -94,43 +101,43 @@ func (msg *NewBets) WriteTo(out io.Writer) (int, error) {
 	return bodyBuff.Len(), nil
 }
 
-// Serializes the bet and adds it to the writer.
+// Serializes the bet and adds it to the writer, incrementing the betsCounter.
 // If the full NewBets package would exceed 8kB or the amount of bets would exceed the batchLimit, the bet is not
 // added to the body, instead the full NewBets package is built (adding the opcode, body length, and `betsCounter`,
-// that represents the amount of bets) and written to finalOutput.
-// Returns the new betsCounter, and error if some write operation failed.
-func AddBetToBody(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer, betsCounter int32, batchLimit int32) (int32, error) {
+// that represents the amount of bets) and written to finalOutput. Finally, the body is empty and the bet is added,
+// reseting the betsCounter to 1.
+// Returns the error if some i/o operation failed.
+func AddBetToBody(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer, betsCounter *int32, batchLimit int32) error {
 	var buff bytes.Buffer
-	if err := binary.Write(&buff, binary.LittleEndian, int32(len(bet))); err != nil {
-		return betsCounter, err
+	if err := writeStringMap(&buff, bet); err != nil {
+		return err
 	}
-	for k, v := range bet {
-		if err := writePair(&buff, k, v); err != nil {
-			return betsCounter, err
-		}
-	}
-	if to.Len()+buff.Len()+1+4+4 <= 8*1024 && betsCounter+1 <= batchLimit {
+	if to.Len()+buff.Len()+1+4+4 <= 8*1024 && *betsCounter+1 <= batchLimit {
 		_, err := io.Copy(to, &buff)
 		if err != nil {
-			return betsCounter, err
+			return err
 		}
-		betsCounter++
-		return betsCounter, nil
+		*betsCounter++
+		return nil
 	}
 	if err := binary.Write(finalOutput, binary.LittleEndian, NewBetsOpCode); err != nil {
-		return betsCounter, err
+		return err
 	}
 	if err := binary.Write(finalOutput, binary.LittleEndian, int32(4+to.Len())); err != nil {
-		return betsCounter, err
+		return err
 	}
-	if err := binary.Write(finalOutput, binary.LittleEndian, betsCounter); err != nil {
-		return betsCounter, err
+	if err := binary.Write(finalOutput, binary.LittleEndian, *betsCounter); err != nil {
+		return err
 	}
 	if _, err := io.Copy(finalOutput, to); err != nil {
-		return betsCounter, err
+		return err
 	}
 	to.Reset()
-	return betsCounter, nil
+	if err := writeStringMap(to, bet); err != nil {
+		return err
+	}
+	*betsCounter = 1
+	return nil
 }
 
 type Readable interface {
