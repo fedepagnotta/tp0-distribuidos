@@ -361,7 +361,7 @@ networks:
 - Modificar `./server/config.ini` o `./client/config.yaml` en el host impacta inmediatamente en los contenedores al reiniciarlos, **sin reconstrucción** de imágenes.
 - El montaje en `:ro` asegura que los contenedores **no** modifiquen los archivos de configuración del host.
 
-### Ejercicio N°2:
+### Ejercicio N°3:
 
 #### Enfoque general
 
@@ -435,3 +435,138 @@ requieren puertos publicados hacia el host ni instalación de herramientas fuera
 
 Se utiliza **Alpine** por ser una base **ligera**, con un conjunto de herramientas **acotado** y suficiente para el objetivo del ejercicio.
 Permite instalar `netcat-openbsd` de forma simple y mantener la imagen mínima necesaria para ejecutar la validación.
+
+### Ejercicio N°4:
+
+#### Server
+
+Se utilizó un nuevo parámetro `_running` en la clase `Server`, que se inicializa en `False`, y en el método `Server.run()` se setea a `True`. La condición del `while`
+pasa a chequear ese parámetro, de tal forma que, al convertirse en `False`, se dejan de aceptar nuevas conexiones.
+
+Para cambiar el valor de `_running` se creó un handler para la señal `SIGTERM`. En este handler, llamado `__stop_running`, se setea `_running` a `False`, y se cierra
+el `socket` del server (`Server._server_socket`). Al cerrar el `socket` se evita que el el proceso quede bloqueado esperando una nueva conexión de un cliente, ya que se
+podría dar que se chequea la condición del `while`, se cumple esa condición, se pasa a esperar una nueva conexión, y recién ahí llega un `SIGTERM`. Cerrando el socket
+hacemos que falle el `accept()` con `OSError`, y ahí se chequea si `self._running == False`, y en ese caso se rompe el loop en vez de propagar el error.
+
+Cuando se sale del loop principal de `run`, se llama a `logging.shutdown()` para flushear buffers y liberar recursos utilizados para logging.
+
+En resumen: al recibir `SIGTERM`, se drena la última conexión establecida con un cliente y se dejan de aceptar conexiones nuevas.
+
+Versión final de `run()`:
+
+```python
+    def run(self):
+        """
+        Dummy Server loop
+
+        Server that accept a new connections and establishes a
+        communication with a client. After client with communucation
+        finishes, servers starts to accept new connections again
+        """
+
+        self._running = True
+        signal.signal(signal.SIGTERM, self.__stop_running)
+        while self._running:
+            try:
+                client_sock = self.__accept_new_connection()
+                self.__handle_client_connection(client_sock)
+            except OSError:
+                if not self._running:
+                    break
+                raise
+        logging.shutdown()
+```
+
+Versión final de `__stop_running()`:
+
+```python
+    def __stop_running(self, signum, frame):
+        self._running = False
+        self._server_socket.close()
+```
+
+#### Client
+
+Se utilizó un `context` creado con `signal.NotifyContext`, para "bypassear" el comportamiento por defecto de Go a la hora de recibir señales `SIGTERM`. En otras palabras,
+`signal.NotifyContext` convierte `SIGTERM` en cancelación de contexto, lo que permite handlear la interrupción, limpiando lo necesario y terminando de forma ordenada.
+
+Este contexto se creó en la función `StartClientLoop`. Seguido de esto, se utilizó `defer stop()` para posponer la interrupción del programa hasta que la función
+retorne. De esta forma, se puede handlear la señal, hacer un `graceful shutdown`, y finalmente terminar la ejecución.
+
+El loop de `StartClientLoop` fue modificado, quedando así:
+
+```go
+for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
+    select {
+    case <-ctx.Done():
+        return
+    default:
+    }
+    // Create the connection the server in every loop iteration. Send an
+    c.createClientSocket()
+
+    // TODO: Modify the send to avoid short-write
+    fmt.Fprintf(
+        c.conn,
+        "[CLIENT %v] Message N°%v\n",
+        c.config.ID,
+        msgID,
+    )
+
+    readDone := make(chan struct{})
+    var msg string
+    var err error
+    go func() {
+        msg, err = bufio.NewReader(c.conn).ReadString('\n')
+        close(readDone)
+    }()
+
+    timer := time.NewTimer(c.config.LoopPeriod)
+    select {
+    case <-ctx.Done():
+        _ = c.conn.SetReadDeadline(time.Now())
+        <-readDone
+        timer.Stop()
+        c.conn.Close()
+        return
+    case <-timer.C:
+        select {
+        case <-ctx.Done():
+            _ = c.conn.SetReadDeadline(time.Now())
+            <-readDone
+            timer.Stop()
+            c.conn.Close()
+            return
+        case <-readDone:
+            c.conn.Close()
+            if err != nil {
+                log.Errorf("action: receive_message | result: fail | client_id: %v | error: %v",
+                    c.config.ID,
+                    err,
+                )
+                return
+            }
+            log.Infof("action: receive_message | result: success | client_id: %v | msg: %v",
+                c.config.ID,
+                msg,
+            )
+        }
+    }
+}
+```
+
+Veámoslo en detalle:
+
+1. Al principio de cada iteración se agregó un chequeo, para ver si la señal ya había sido notificada en el contexto.
+2. La lectura del buffer se pasó a una `goroutine`, que cierra un canal `readDone` al finalizar la lectura.
+3. En vez de hacer un `sleep` para separar los envíos del cliente, se utilizó un `timer`, y luego, utilizando un `select`, la main routine quedó bloqueada
+   esperando la señal del contexto (el `SIGTERM`), o la señal del timer (la finalización del `LoopPeriod` seteado en el archivo de configuración).
+
+- Si lo primero en suceder es que llega el `SIGTERM`, se setea un deadline para la operación de lectura que estaba realizando la goroutine, haciendo que se interrumpa
+  la misma. Luego, se espera a que se cierre el canal `readDone` para frenar el `timer`, cerrar el `socket` del cliente, y retornar para ejecutar el `stop()` del `defer`.
+- Si lo primero en suceder es que se termina el timer, se vuelve a hacer un `select`, esta vez esperando al `SIGTERM` o a que se finalice la lectura de la `goroutine`.
+  Si llega el `SIGTERM` primero, se ejecuta el flujo mencionado justo arriba. En caso contrario, simplemente se cierra el socket de la iteración actual, y se loggea el
+  resultado correspondiente.
+
+De esta forma, tanto la lectura como la espera entre envíos al servidor son interrumpibles de forma ordenada, y se puede realizar un `graceful shutdown` al recibir un
+`SIGTERM`.
