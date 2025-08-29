@@ -51,7 +51,7 @@ func (c *Client) createClientSocket() error {
 	return nil
 }
 
-// SendBet Sends messages to the client until some time threshold is met
+// SendBet Sends bet with the received parameters to the server, and waits for a response (success or fail)
 func (c *Client) SendBet(name string, lastName string, dni string, birthDate string, number string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
