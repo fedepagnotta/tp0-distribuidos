@@ -360,3 +360,78 @@ networks:
 - La configuración queda **por fuera de la imagen** y se **inyecta** en tiempo de ejecución.
 - Modificar `./server/config.ini` o `./client/config.yaml` en el host impacta inmediatamente en los contenedores al reiniciarlos, **sin reconstrucción** de imágenes.
 - El montaje en `:ro` asegura que los contenedores **no** modifiquen los archivos de configuración del host.
+
+### Ejercicio N°2:
+
+#### Enfoque general
+
+Se orquesta un **contenedor auxiliar** (`tester`) que contiene `netcat` y se conecta al servidor a través de una **red interna de Docker**.
+De esta forma, la interacción se realiza **dentro del entorno de contenedores**, cumpliendo la restricción de no instalar herramientas en el host ni exponer puertos.
+
+#### Flujo del script `validar-echo-server.sh`
+
+1. **Lectura de configuración del servidor**
+   Se extraen `SERVER_IP` y `SERVER_PORT` desde `./server/config.ini` con `awk`.
+
+2. **Artefactos temporales con timestamp**
+   Se generan nombres únicos para:
+   - Archivo Compose temporal: `docker-compose-test-<timestamp>.yaml`
+   - Directorio y Dockerfile de la imagen `tester`: `dockerfile-dir-test-<timestamp>/Dockerfile`
+
+3. **Compose mínimo para el tester**
+   Se crea un `docker-compose` con un único servicio `tester` conectado a la red `testing_net` (subred fija), suficiente para ejecutar la validación:
+
+   ```yaml
+   services:
+     tester:
+       image: tester:latest
+       networks:
+         - testing_net
+   networks:
+     testing_net:
+       ipam:
+         config:
+           - subnet: 172.25.125.0/24
+   ```
+
+4. **Imagen `tester` basada en Alpine**
+   Se define un Dockerfile temporal que:
+   - Parte de `alpine:latest`.
+   - Instala `netcat-openbsd`.
+   - Mantiene el contenedor en ejecución con `CMD ["sleep", "infinity"]` para permitir `docker exec`.
+
+5. **Despliegue y ejecución del test**
+   - Se construye la imagen `tester:latest` y se levanta el servicio con `docker compose up -d`.
+   - Se ejecuta, dentro del contenedor `tester`, el envío del mensaje con `netcat`:
+
+     ```sh
+     echo "test_msg_<timestamp>" | timeout 10 nc <SERVER_IP> <SERVER_PORT>
+     ```
+
+   - La **respuesta** se captura en la variable `respuesta`.
+
+6. **Detención, baja y limpieza**
+   Se detiene y elimina el stack temporal (`stop`/`down`) y se borran el Dockerfile/compose generados.
+
+7. **Criterio de validación y salida requerida**
+   - Si `respuesta` coincide exactamente con `test_msg_<timestamp>`, se imprime:
+
+     ```
+     action: test_echo_server | result: success
+     ```
+
+   - En caso contrario:
+
+     ```
+     action: test_echo_server | result: fail
+     ```
+
+#### Por qué no se exponen puertos ni se instala en el host
+
+La comunicación se realiza **contenedor a contenedor** sobre la red `testing_net`. El contenedor `tester` actúa como cliente `netcat`, por lo que no se
+requieren puertos publicados hacia el host ni instalación de herramientas fuera de Docker.
+
+#### Elección de Alpine para la imagen temporal
+
+Se utiliza **Alpine** por ser una base **ligera**, con un conjunto de herramientas **acotado** y suficiente para el objetivo del ejercicio.
+Permite instalar `netcat-openbsd` de forma simple y mantener la imagen mínima necesaria para ejecutar la validación.
