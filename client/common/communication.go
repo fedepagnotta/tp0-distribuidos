@@ -95,10 +95,11 @@ func (msg *NewBets) WriteTo(out io.Writer) (int, error) {
 }
 
 // Serializes the bet and adds it to the writer.
-// If the full NewBets package would exceed 8kB, the bet is not added to the body, instead the full NewBets package
-// is built (adding the opcode, body length, and `betsCounter`, that represents the amount of bets) and written to finalOutput.
+// If the full NewBets package would exceed 8kB or the amount of bets would exceed the batchLimit, the bet is not
+// added to the body, instead the full NewBets package is built (adding the opcode, body length, and `betsCounter`,
+// that represents the amount of bets) and written to finalOutput.
 // Returns the new betsCounter, and error if some write operation failed.
-func AddBetToBody(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer, betsCounter int32) (int32, error) {
+func AddBetToBody(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer, betsCounter int32, batchLimit int32) (int32, error) {
 	var buff bytes.Buffer
 	if err := binary.Write(&buff, binary.LittleEndian, int32(len(bet))); err != nil {
 		return betsCounter, err
@@ -108,7 +109,7 @@ func AddBetToBody(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer
 			return betsCounter, err
 		}
 	}
-	if to.Len()+buff.Len()+1+4+4 <= 8*1024 {
+	if to.Len()+buff.Len()+1+4+4 <= 8*1024 && betsCounter+1 <= batchLimit {
 		_, err := io.Copy(to, &buff)
 		if err != nil {
 			return betsCounter, err
