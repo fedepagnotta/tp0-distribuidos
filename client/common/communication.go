@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"net"
 )
 
 const NewBetsOpCode byte = 0
@@ -29,7 +28,7 @@ type Message interface {
 type Writeable interface {
 	// writes contents to out following the package format (opcode, length, body)
 	// returns the total length of the body, or error if the write failed
-	WriteTo(out net.Conn) (int, error)
+	WriteTo(out io.Writer) (int, error)
 }
 
 func writeString(buff *bytes.Buffer, s string) error {
@@ -69,7 +68,7 @@ func (msg *NewBets) GetOpCode() byte {
 	return NewBetsOpCode
 }
 
-func (msg *NewBets) WriteTo(out net.Conn) (int, error) {
+func (msg *NewBets) WriteTo(out io.Writer) (int, error) {
 	var buff bytes.Buffer
 	if err := buff.WriteByte(NewBetsOpCode); err != nil {
 		return 0, err
@@ -93,6 +92,44 @@ func (msg *NewBets) WriteTo(out net.Conn) (int, error) {
 		return 0, err
 	}
 	return bodyBuff.Len(), nil
+}
+
+// Serializes the bet and adds it to the writer.
+// If the full NewBets package would exceed 8kB, the bet is not added to the body, instead the full NewBets package
+// is built (adding the opcode, body length, and `betsCounter`, that represents the amount of bets) and written to finalOutput.
+// Returns the new betsCounter, and error if some write operation failed.
+func AddBetToBody(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer, betsCounter int32) (int32, error) {
+	var buff bytes.Buffer
+	if err := binary.Write(&buff, binary.LittleEndian, int32(len(bet))); err != nil {
+		return betsCounter, err
+	}
+	for k, v := range bet {
+		if err := writePair(&buff, k, v); err != nil {
+			return betsCounter, err
+		}
+	}
+	if to.Len()+buff.Len()+1+4+4 <= 8*1024 {
+		_, err := io.Copy(to, &buff)
+		if err != nil {
+			return betsCounter, err
+		}
+		betsCounter++
+		return betsCounter, nil
+	}
+	if err := binary.Write(finalOutput, binary.LittleEndian, NewBetsOpCode); err != nil {
+		return betsCounter, err
+	}
+	if err := binary.Write(finalOutput, binary.LittleEndian, int32(4+to.Len())); err != nil {
+		return betsCounter, err
+	}
+	if err := binary.Write(finalOutput, binary.LittleEndian, betsCounter); err != nil {
+		return betsCounter, err
+	}
+	if _, err := io.Copy(finalOutput, to); err != nil {
+		return betsCounter, err
+	}
+	to.Reset()
+	return betsCounter, nil
 }
 
 type Readable interface {
