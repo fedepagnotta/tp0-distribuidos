@@ -189,6 +189,253 @@ La corrección personal tendrá en cuenta la calidad del código entregado y cas
 
 ## Notas sobre la solución de los ejercicios
 
+### Ejercicio N°1:
+
+#### Objetivo
+
+El script genera dinámicamente un archivo **Docker Compose** que define:
+
+- Un servicio **server**.
+- **N** servicios **client** numerados consecutivamente (**client1**, **client2**, …), donde **N** se pasa por parámetro.
+- Una **red** dedicada (`testing_net`) con un **subred** IPAM fijo.
+
+#### Interfaz y parámetros
+
+El script se invoca en la raíz del proyecto con:
+
+```bash
+./generar-compose.sh <archivo_salida> <cantidad_clientes>
+```
+
+Ejemplo:
+
+```bash
+./generar-compose.sh docker-compose-dev.yaml 5
+```
+
+- **\$1**: nombre del archivo Compose a generar.
+- **\$2**: cantidad de clientes a definir.
+
+#### Flujo general (paso a paso)
+
+1. **Reporte de parámetros**
+   Imprime los valores recibidos para facilitar el diagnóstico:
+
+   ```bash
+   echo "Nombre del archivo de salida: $1"
+   echo "Cantidad de clientes: $2"
+   ```
+
+2. **Creación/limpieza del archivo**
+   Garantiza que el archivo de salida exista y, acto seguido, lo **sobrescribe** con el bloque YAML inicial (operador `>`):
+
+   ```bash
+   touch $1
+   echo "name: tp0
+   services:
+     server:
+       container_name: server
+       image: server:latest
+       entrypoint: python3 /main.py
+       environment:
+         - PYTHONUNBUFFERED=1
+         - LOGGING_LEVEL=DEBUG
+       networks:
+         - testing_net" > $1
+   ```
+
+3. **Bucle de clientes**
+   Genera **client1…clientN** con `seq` y **anexa** (operador `>>`) cada bloque al YAML:
+
+   ```bash
+   for i in $(seq 1 $2); do
+       echo "
+     client$i:
+       container_name: client$i
+       image: client:latest
+       entrypoint: /client
+       environment:
+         - CLI_ID=$i
+         - CLI_LOG_LEVEL=DEBUG
+       networks:
+         - testing_net
+       depends_on:
+         - server" >> $1
+   done
+   ```
+
+   - Cada cliente:
+     - Usa `container_name: client<i>` para cumplir el formato solicitado (client1, client2, …).
+     - Pasa `CLI_ID=$i` y `CLI_LOG_LEVEL=DEBUG` como variables de entorno.
+     - Declara dependencia de **server** con `depends_on` (orden de arranque).
+
+4. **Definición de la red**
+   Cierra el archivo con la red compartida por todos los servicios:
+
+   ```bash
+   echo "
+   networks:
+     testing_net:
+       ipam:
+         driver: default
+         config:
+           - subnet: 172.25.125.0/24" >> $1
+   ```
+
+   - `ipam.config.subnet` fija un rango predecible; útil para pruebas y debugging de conectividad.
+
+#### Esquema resultante (ejemplo con 2 clientes)
+
+```yaml
+name: tp0
+services:
+  server:
+    container_name: server
+    image: server:latest
+    entrypoint: python3 /main.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOGGING_LEVEL=DEBUG
+    networks:
+      - testing_net
+
+  client1:
+    container_name: client1
+    image: client:latest
+    entrypoint: /client
+    environment:
+      - CLI_ID=1
+      - CLI_LOG_LEVEL=DEBUG
+    networks:
+      - testing_net
+    depends_on:
+      - server
+
+  client2:
+    container_name: client2
+    image: client:latest
+    entrypoint: /client
+    environment:
+      - CLI_ID=2
+      - CLI_LOG_LEVEL=DEBUG
+    networks:
+      - testing_net
+    depends_on:
+      - server
+
+networks:
+  testing_net:
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.25.125.0/24
+```
+
+### Ejercicio N°2:
+
+#### Cambios en el Dockerfile del cliente
+
+- Se elimina la copia del `config.yaml` dentro de la imagen:
+  - **Antes:** `COPY ./client/config.yaml /config.yaml`
+  - **Ahora:** no se incluye el archivo de configuración en la imagen.
+
+#### Cambios en `generar-compose.sh`
+
+- **Servidor**: se monta el `config.ini` del host dentro del contenedor en modo **read-only**:
+
+  ```yaml
+  volumes:
+    - ./server/config.ini:/config.ini:ro
+  ```
+
+- **Clientes**: se monta el `config.yaml` del host dentro de cada contenedor en modo **read-only**:
+
+  ```yaml
+  volumes:
+    - ./client/config.yaml:/config.yaml:ro
+  ```
+
+#### Resultado
+
+- La configuración queda **por fuera de la imagen** y se **inyecta** en tiempo de ejecución.
+- Modificar `./server/config.ini` o `./client/config.yaml` en el host impacta inmediatamente en los contenedores al reiniciarlos, **sin reconstrucción** de imágenes.
+- El montaje en `:ro` asegura que los contenedores **no** modifiquen los archivos de configuración del host.
+
+### Ejercicio N°3:
+
+#### Enfoque general
+
+Se orquesta un **contenedor auxiliar** (`tester`) que contiene `netcat` y se conecta al servidor a través de una **red interna de Docker**.
+De esta forma, la interacción se realiza **dentro del entorno de contenedores**, cumpliendo la restricción de no instalar herramientas en el host ni exponer puertos.
+
+#### Flujo del script `validar-echo-server.sh`
+
+1. **Lectura de configuración del servidor**
+   Se extraen `SERVER_IP` y `SERVER_PORT` desde `./server/config.ini` con `awk`.
+
+2. **Artefactos temporales con timestamp**
+   Se generan nombres únicos para:
+   - Archivo Compose temporal: `docker-compose-test-<timestamp>.yaml`
+   - Directorio y Dockerfile de la imagen `tester`: `dockerfile-dir-test-<timestamp>/Dockerfile`
+
+3. **Compose mínimo para el tester**
+   Se crea un `docker-compose` con un único servicio `tester` conectado a la red `testing_net` (subred fija), suficiente para ejecutar la validación:
+
+   ```yaml
+   services:
+     tester:
+       image: tester:latest
+       networks:
+         - testing_net
+   networks:
+     testing_net:
+       ipam:
+         config:
+           - subnet: 172.25.125.0/24
+   ```
+
+4. **Imagen `tester` basada en Alpine**
+   Se define un Dockerfile temporal que:
+   - Parte de `alpine:latest`.
+   - Instala `netcat-openbsd`.
+   - Mantiene el contenedor en ejecución con `CMD ["sleep", "infinity"]` para permitir `docker exec`.
+
+5. **Despliegue y ejecución del test**
+   - Se construye la imagen `tester:latest` y se levanta el servicio con `docker compose up -d`.
+   - Se ejecuta, dentro del contenedor `tester`, el envío del mensaje con `netcat`:
+
+     ```sh
+     echo "test_msg_<timestamp>" | timeout 10 nc <SERVER_IP> <SERVER_PORT>
+     ```
+
+   - La **respuesta** se captura en la variable `respuesta`.
+
+6. **Detención, baja y limpieza**
+   Se detiene y elimina el stack temporal (`stop`/`down`) y se borran el Dockerfile/compose generados.
+
+7. **Criterio de validación y salida requerida**
+   - Si `respuesta` coincide exactamente con `test_msg_<timestamp>`, se imprime:
+
+     ```
+     action: test_echo_server | result: success
+     ```
+
+   - En caso contrario:
+
+     ```
+     action: test_echo_server | result: fail
+     ```
+
+#### Por qué no se exponen puertos ni se instala en el host
+
+La comunicación se realiza **contenedor a contenedor** sobre la red `testing_net`. El contenedor `tester` actúa como cliente `netcat`, por lo que no se
+requieren puertos publicados hacia el host ni instalación de herramientas fuera de Docker.
+
+#### Elección de Alpine para la imagen temporal
+
+Se utiliza **Alpine** por ser una base **ligera**, con un conjunto de herramientas **acotado** y suficiente para el objetivo del ejercicio.
+Permite instalar `netcat-openbsd` de forma simple y mantener la imagen mínima necesaria para ejecutar la validación.
+
 ### Ejercicio N°4:
 
 #### Server
