@@ -37,7 +37,8 @@ for i in $(seq 1 $2); do
     depends_on:
       - server
     volumes:
-      - ./client/config.yaml:/config.yaml:ro" >> $1
+      - ./client/config.yaml:/config.yaml:ro
+      - ./.data/agency-$i.csv:/bets.csv:ro" >> $1
 done
 
 echo "
