@@ -429,7 +429,6 @@ mientras que la lógica de negocio del cliente (abrir socket, enviar apuesta, es
 
    - Si hay error de I/O, `opcode` inválido, `length` no esperado, o respuesta `BETS_RECV_FAIL`, se loguea el caso `fail` con los
      mismos campos de contexto (`dni`, `numero`).
-   - Se usa `go-logging` y se reportan también errores críticos de conexión (por ejemplo, en `createClientSocket`).
 
 ---
 
@@ -508,17 +507,6 @@ El servidor se organiza en módulos con responsabilidades bien delimitadas:
      de la E/S en disco. Si se quisiera confirmar _persistencia_ y no solo _recepción_, el protocolo podría evolucionar para que el ack llegue **después** del
      `process()` o para transportar un código de error; tal cambio no es requerido por la consigna actual.
    - En caso de errores de protocolo o EOF, se responde `BETS_RECV_FAIL` como indica la especificación.
-
-6. **Señales, ciclo de vida y cierre ordenado**
-   - `Server.run()` registra un handler de `SIGTERM` (`__stop_running`) que setea `_running=False` y **cierra el socket de escucha**. Así, si el proceso
-     estaba bloqueado en `accept()`, este falla con `OSError`, se detecta que `_running=False` y el loop finaliza sin quedar colgado (graceful shutdown).
-   - Al salir del loop se invoca `logging.shutdown()` para vaciar buffers y cerrar handlers de logging.
-
-7. **Configuración y validaciones auxiliares**
-   - `server/main.py` unifica configuración desde **variables de entorno** y/o `config.ini` (`SERVER_PORT`, `SERVER_LISTEN_BACKLOG`, `LOGGING_LEVEL`),
-     con verificación y reporting temprano de errores de parseo (`KeyError`/`ValueError`).
-   - `utils.Bet` valida/coerce tipos de dominio (e.g., `agency` y `number` a `int`, `birthdate` con `fromisoformat`), que protege contra entradas mal formadas
-     aun cuando el framing fuera correcto.
 
 ---
 
