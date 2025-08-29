@@ -26,11 +26,6 @@ for i in $(seq 1 $2); do
     entrypoint: /client
     environment:
       - CLI_ID=$i
-      - NOMBRE=Nombre_$i
-      - APELLIDO=Apellido_$i
-      - DOCUMENTO=$i
-      - NACIMIENTO=2000-01-0$i
-      - NUMERO=100$i
       # - CLI_LOG_LEVEL=DEBUG
     networks:
       - testing_net
