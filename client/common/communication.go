@@ -107,7 +107,7 @@ func (msg *NewBets) WriteTo(out io.Writer) (int, error) {
 // that represents the amount of bets) and written to finalOutput. Finally, the body is empty and the bet is added,
 // reseting the betsCounter to 1.
 // Returns the error if some i/o operation failed.
-func AddBetToBody(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer, betsCounter *int32, batchLimit int32) error {
+func AddBetWithFlush(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer, betsCounter *int32, batchLimit int32) error {
 	var buff bytes.Buffer
 	if err := writeStringMap(&buff, bet); err != nil {
 		return err
