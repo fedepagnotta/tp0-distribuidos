@@ -30,6 +30,7 @@ class NewBets:
             "NACIMIENTO",
             "NUMERO",
         )
+        self.amount: int = 0
 
     def process(self):
         utils.store_bets(self.bets)
@@ -50,13 +51,16 @@ class NewBets:
         (n_pairs, remaining) = read_i32(sock, remaining, self.opcode)
         if n_pairs != 6:
             raise ProtocolError("invalid body", self.opcode)
-        for _ in range(0, n_pairs):
+
+        for _ in range(n_pairs):
             (k, v, remaining) = self.__read_pair(sock, remaining)
             curr_bet[k] = v
+
         if [k for k in self.required if k not in curr_bet]:
             raise ProtocolError("invalid body", self.opcode)
-        self.bets.append(
-            utils.Bet(
+
+        try:
+            bet = utils.Bet(
                 curr_bet["AGENCIA"],
                 curr_bet["NOMBRE"],
                 curr_bet["APELLIDO"],
@@ -64,18 +68,27 @@ class NewBets:
                 curr_bet["NACIMIENTO"],
                 curr_bet["NUMERO"],
             )
-        )
+        except (ValueError, TypeError) as e:
+            raise ProtocolError("invalid body", self.opcode) from e
+
+        self.bets.append(bet)
         return remaining
 
-    def read_from(self, sock: socket.socket, length: int):
+    def read_from(self, sock, length: int):
         remaining = length
-        (n_bets, remaining) = read_i32(sock, remaining, self.opcode)
-        for _ in range(0, n_bets):
-            remaining = self.__read_bet(sock, remaining)
-        if remaining != 0:
-            raise ProtocolError(
-                "indicated length doesn't match body length", self.opcode
-            )
+        try:
+            n_bets, remaining = read_i32(sock, remaining, self.opcode)
+            self.amount = n_bets
+            for _ in range(n_bets):
+                remaining = self.__read_bet(sock, remaining)
+            if remaining != 0:
+                raise ProtocolError(
+                    "indicated length doesn't match body length", self.opcode
+                )
+        except ProtocolError:
+            if remaining > 0:
+                _ = recv_exactly(sock, remaining)
+            raise
 
 
 def recv_exactly(sock: socket.socket, n: int) -> bytes:
