@@ -859,3 +859,9 @@ def run(self):
 ```
 
 En conjunto, el servidor garantiza: (a) deserialización exacta y validación integral del **batch completo**, (b) **descartado total** ante la primera apuesta inválida, (c) **ausencia de short reads/writes** visibles para la lógica gracias a `recv_exactly` y `sendall`, y (d) **terminación ordenada** ante `SIGTERM`, sin aceptar nuevas conexiones y permitiendo que la última conexión activa finalice su procesamiento.
+
+### Ejercicio N°7:
+
+#### Actualización del protocolo
+
+Se agrega un nuevo mensaje `FINISH`, que utilizará el cliente para avisar al servidor que terminó con la entrega de todos los batches. Tendrá body vacío, y opcode 4.
