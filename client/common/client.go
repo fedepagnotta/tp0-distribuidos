@@ -147,7 +147,12 @@ func (c *Client) SendBets() {
 	var msg Readable
 	var rerr error
 	go func() {
-		msg, rerr = ReadMessage(reader)
+		for {
+			msg, rerr = ReadMessage(reader)
+			if rerr != nil {
+				break
+			}
+		}
 		close(readDone)
 	}()
 
