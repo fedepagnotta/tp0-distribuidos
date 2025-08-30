@@ -864,4 +864,15 @@ En conjunto, el servidor garantiza: (a) deserialización exacta y validación in
 
 #### Actualización del protocolo
 
-Se agrega un nuevo mensaje `FINISH`, que utilizará el cliente para avisar al servidor que terminó con la entrega de todos los batches. Tendrá body vacío, y opcode 4.
+Se agrega una nueva notación para describir el formato del body: [string list], que consta de un n [int] seguido de n [string].
+
+Se agregan tres mensajes nuevos:
+
+- `FINISH`, con opcode **3**, que utilizará el cliente para avisar al servidor que terminó con la entrega de todos los batches. Tendrá body vacío.
+- `REQUEST_WINNERS`, con opcode **4**, que utilizará el cliente para solicitar los ganadores correspondientes a su agencia. El body es un [int]
+  que contendrá el ID de la agencia.
+- `WINNERS`, con opcode **5**, que utilizará el server para notificar los ganadores correspondientes a cada agencia. El body es un [string list],
+  que contendrá los DNI de todos los ganadores.
+
+Para proteger al servido de clientes maliciosos, si el servidor recibe un `REQUEST_WINNERS` de un cliente que no había enviado `FINISH` anteriormente,
+directamente cierra la conexión.
