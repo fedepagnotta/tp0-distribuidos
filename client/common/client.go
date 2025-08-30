@@ -134,17 +134,16 @@ func (c *Client) SendBets() {
 		writeDone <- c.buildAndSendBatches(ctx, betsReader)
 	}()
 
-	reader := bufio.NewReader(c.conn)
+	conn := c.conn
+	reader := bufio.NewReader(conn)
 	readDone := make(chan struct{})
 	go func() {
-	readerLoop:
 		for {
 			msg, err := ReadMessage(reader)
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
+				if !errors.Is(err, io.EOF) {
+					log.Errorf("action: leer_respuesta | result: fail | err: %v", err)
 				}
-				log.Errorf("action: leer_respuesta | result: fail | err: %v", err)
 				break
 			}
 			switch msg.GetOpCode() {
@@ -152,11 +151,6 @@ func (c *Client) SendBets() {
 				log.Info("action: bets_enviadas | result: success")
 			case BetsRecvFailOpCode:
 				log.Error("action: bets_enviadas | result: fail")
-			case WinnersOpCode:
-				{
-					log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d", len(msg.(*Winners).List))
-					break readerLoop
-				}
 			}
 		}
 		close(readDone)
@@ -182,12 +176,40 @@ func (c *Client) SendBets() {
 
 		log.Infof("action: send_finished | result: success | agencyId: %d", int32(agencyId))
 
-		reqMsg := RequestWinners{int32(agencyId)}
-		if _, err := reqMsg.WriteTo(c.conn); err != nil {
-			log.Errorf("action: send_request_winners | result: fail | error: %v", err)
-		}
+		for {
+			if err := c.createClientSocket(); err != nil {
+				return
+			}
+			conn := c.conn
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-		log.Infof("action: send_request_winners | result: success | agencyId: %d", int32(agencyId))
+			reqMsg := RequestWinners{int32(agencyId)}
+			if _, err := reqMsg.WriteTo(conn); err != nil {
+				conn.Close()
+				log.Errorf("action: send_request_winners | result: fail | error: %v", err)
+				return
+			}
+			log.Infof("action: send_request_winners | result: success | agencyId: %d", int32(agencyId))
+
+			reader := bufio.NewReader(conn)
+			msg, err := ReadMessage(reader)
+			conn.Close()
+
+			if err == nil && msg.GetOpCode() == WinnersOpCode {
+				log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d",
+					len(msg.(*Winners).List))
+				break
+			}
+			if errors.Is(err, io.EOF) {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+				continue
+			}
+			log.Errorf("action: leer_respuesta | result: fail | err: %v", err)
+		}
 	}
 	select {
 	case <-ctx.Done():
