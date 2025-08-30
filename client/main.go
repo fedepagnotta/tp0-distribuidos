@@ -108,19 +108,11 @@ func main() {
 	clientConfig := common.ClientConfig{
 		ServerAddress: v.GetString("server.address"),
 		ID:            v.GetString("id"),
+		BetsFilePath:  "./bets.csv",
+		BatchLimit:    v.GetInt32("batch.maxAmount"),
 	}
 
 	client := common.NewClient(clientConfig)
 
-	name, nameExists := os.LookupEnv("NOMBRE")
-	lastName, lastNameExists := os.LookupEnv("APELLIDO")
-	dni, dniExists := os.LookupEnv("DOCUMENTO")
-	birthDate, birthDateExists := os.LookupEnv("NACIMIENTO")
-	number, numberExists := os.LookupEnv("NUMERO")
-	if !nameExists || !lastNameExists || !dniExists || !birthDateExists || !numberExists {
-		log.Critical("env variables missing")
-		return
-	}
-
-	client.SendBet(name, lastName, dni, birthDate, number)
+	client.SendBets()
 }
