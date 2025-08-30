@@ -11,6 +11,7 @@ import (
 const NewBetsOpCode byte = 0
 const BetsRecvSuccessOpCode byte = 1
 const BetsRecvFailOpCode byte = 2
+const FinishedOpCode byte = 3
 
 type ProtocolError struct {
 	Msg    string
@@ -23,6 +24,22 @@ func (e *ProtocolError) Error() string {
 
 type Message interface {
 	GetOpCode() byte
+}
+
+type Finished struct{}
+
+func (msg *Finished) GetOpCode() byte {
+	return FinishedOpCode
+}
+
+func (msg *Finished) WriteTo(out io.Writer) error {
+	if err := binary.Write(out, binary.LittleEndian, msg.GetOpCode()); err != nil {
+		return err
+	}
+	if err := binary.Write(out, binary.LittleEndian, 0); err != nil {
+		return err
+	}
+	return nil
 }
 
 func writeString(buff *bytes.Buffer, s string) error {
