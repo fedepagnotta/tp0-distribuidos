@@ -25,12 +25,6 @@ type Message interface {
 	GetOpCode() byte
 }
 
-type Writeable interface {
-	// writes contents to out following the package format (opcode, length, body)
-	// returns the total length of the body, or error if the write failed
-	WriteTo(out io.Writer) (int, error)
-}
-
 func writeString(buff *bytes.Buffer, s string) error {
 	if err := binary.Write(buff, binary.LittleEndian, int32(len(s))); err != nil {
 		return err
@@ -56,49 +50,6 @@ func writeStringMap(buff *bytes.Buffer, body map[string]string) error {
 		}
 	}
 	return nil
-}
-
-func writeMultiStringMap(buff *bytes.Buffer, body []map[string]string) error {
-	for _, m := range body {
-		if err := writeStringMap(buff, m); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-type NewBets struct {
-	Bets []map[string]string
-}
-
-func (msg *NewBets) GetOpCode() byte {
-	return NewBetsOpCode
-}
-
-func (msg *NewBets) WriteTo(out io.Writer) (int, error) {
-	var buff bytes.Buffer
-	if err := buff.WriteByte(NewBetsOpCode); err != nil {
-		return 0, err
-	}
-	var bodyBuff bytes.Buffer
-	if err := binary.Write(&bodyBuff, binary.LittleEndian, int32(len(msg.Bets))); err != nil {
-		return 0, err
-	}
-	if err := writeMultiStringMap(&bodyBuff, msg.Bets); err != nil {
-		return 0, err
-	}
-	if err := binary.Write(&buff, binary.LittleEndian, int32(bodyBuff.Len())); err != nil {
-		return 0, err
-	}
-	_, err := buff.Write(bodyBuff.Bytes())
-	if err != nil {
-		return 0, err
-	}
-	_, err = io.Copy(out, &buff)
-	if err != nil {
-		return 0, err
-	}
-	return bodyBuff.Len(), nil
 }
 
 // Serializes the bet and adds it to the writer, incrementing the betsCounter.
