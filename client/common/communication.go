@@ -12,6 +12,8 @@ const NewBetsOpCode byte = 0
 const BetsRecvSuccessOpCode byte = 1
 const BetsRecvFailOpCode byte = 2
 const FinishedOpCode byte = 3
+const RequestWinnersOpCode byte = 4
+const WinnersOpCode byte = 5
 
 type ProtocolError struct {
 	Msg    string
@@ -24,22 +26,61 @@ func (e *ProtocolError) Error() string {
 
 type Message interface {
 	GetOpCode() byte
+	GetLength() int32
 }
 
-type Finished struct{}
+type Writeable interface {
+	WriteTo(out io.Writer) (int32, error)
+}
+
+type Finished struct {
+	AgencyId int32
+}
 
 func (msg *Finished) GetOpCode() byte {
 	return FinishedOpCode
 }
 
-func (msg *Finished) WriteTo(out io.Writer) error {
+func (msg *Finished) GetLength() int32 {
+	return 4
+}
+
+func (msg *Finished) WriteTo(out io.Writer) (int32, error) {
 	if err := binary.Write(out, binary.LittleEndian, msg.GetOpCode()); err != nil {
-		return err
+		return 0, err
 	}
-	if err := binary.Write(out, binary.LittleEndian, 0); err != nil {
-		return err
+	if err := binary.Write(out, binary.LittleEndian, msg.GetLength()); err != nil {
+		return 0, err
 	}
-	return nil
+	if err := binary.Write(out, binary.LittleEndian, msg.AgencyId); err != nil {
+		return 0, err
+	}
+	return 5 + msg.GetLength(), nil
+}
+
+type RequestWinners struct {
+	AgencyId int32
+}
+
+func (msg *RequestWinners) GetOpCode() byte {
+	return RequestWinnersOpCode
+}
+
+func (msg *RequestWinners) GetLength() int32 {
+	return 4
+}
+
+func (msg *RequestWinners) WriteTo(out io.Writer) (int32, error) {
+	if err := binary.Write(out, binary.LittleEndian, msg.GetOpCode()); err != nil {
+		return 0, err
+	}
+	if err := binary.Write(out, binary.LittleEndian, msg.GetLength()); err != nil {
+		return 0, err
+	}
+	if err := binary.Write(out, binary.LittleEndian, msg.AgencyId); err != nil {
+		return 0, err
+	}
+	return 5 + msg.GetLength(), nil
 }
 
 func writeString(buff *bytes.Buffer, s string) error {
@@ -116,7 +157,7 @@ func FlushBatch(batch *bytes.Buffer, out io.Writer, betsCounter int32) error {
 }
 
 type Readable interface {
-	readFrom(reader *bufio.Reader) (Readable, error)
+	readFrom(reader *bufio.Reader) error
 	Message
 }
 
@@ -126,15 +167,19 @@ func (msg *BetsRecvSuccess) GetOpCode() byte {
 	return BetsRecvSuccessOpCode
 }
 
-func (msg *BetsRecvSuccess) readFrom(reader *bufio.Reader) (Readable, error) {
+func (msg *BetsRecvSuccess) GetLength() int32 {
+	return 0
+}
+
+func (msg *BetsRecvSuccess) readFrom(reader *bufio.Reader) error {
 	var length int32
 	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
-		return nil, err
+		return err
 	}
-	if length != 0 {
-		return nil, &ProtocolError{"invalid body length", BetsRecvSuccessOpCode}
+	if length != msg.GetLength() {
+		return &ProtocolError{"invalid body length", BetsRecvSuccessOpCode}
 	}
-	return msg, nil
+	return nil
 }
 
 type BetsRecvFail struct{}
@@ -143,15 +188,80 @@ func (msg *BetsRecvFail) GetOpCode() byte {
 	return BetsRecvFailOpCode
 }
 
-func (msg *BetsRecvFail) readFrom(reader *bufio.Reader) (Readable, error) {
+func (msg *BetsRecvFail) GetLength() int32 {
+	return 0
+}
+
+func (msg *BetsRecvFail) readFrom(reader *bufio.Reader) error {
 	var length int32
 	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
-		return nil, err
+		return err
 	}
-	if length != 0 {
-		return nil, &ProtocolError{"invalid body length", BetsRecvFailOpCode}
+	if length != msg.GetLength() {
+		return &ProtocolError{"invalid body length", BetsRecvFailOpCode}
 	}
-	return msg, nil
+	return nil
+}
+
+type Winners struct {
+	List []string
+}
+
+func (msg *Winners) GetOpCode() byte {
+	return WinnersOpCode
+}
+
+func (msg *Winners) GetLength() int32 {
+	var totalLen int32 = 4
+	for _, doc := range msg.List {
+		totalLen += 4 + int32(len(doc))
+	}
+	return totalLen
+}
+
+func (msg *Winners) readFrom(reader *bufio.Reader) error {
+	var remaining int32
+	if err := binary.Read(reader, binary.LittleEndian, &remaining); err != nil {
+		return err
+	}
+	if remaining < 4 {
+		return &ProtocolError{"invalid body length", msg.GetOpCode()}
+	}
+	var nWinners int32
+	if err := binary.Read(reader, binary.LittleEndian, &nWinners); err != nil {
+		return err
+	}
+	if nWinners < 0 {
+		return &ProtocolError{"invalid body", msg.GetOpCode()}
+	}
+	remaining -= 4
+	for i := int32(0); i < nWinners; i++ {
+		if remaining < 4 {
+			return &ProtocolError{"invalid body length", msg.GetOpCode()}
+		}
+		var strLen int32
+		if err := binary.Read(reader, binary.LittleEndian, &strLen); err != nil {
+			return err
+		}
+		if strLen < 0 {
+			return &ProtocolError{"invalid body", msg.GetOpCode()}
+		}
+		remaining -= 4
+		if remaining < strLen {
+			return &ProtocolError{"invalid body length", msg.GetOpCode()}
+		}
+		buf := make([]byte, strLen)
+		if _, err := io.ReadFull(reader, buf); err != nil {
+			return err
+		}
+		remaining -= strLen
+		if remaining != 0 {
+			return &ProtocolError{"invalid body length", msg.GetOpCode()}
+		}
+
+		msg.List = append(msg.List, string(buf))
+	}
+	return nil
 }
 
 // reads contents from reader and returns the parsed package
@@ -165,12 +275,20 @@ func ReadMessage(reader *bufio.Reader) (Readable, error) {
 	case BetsRecvSuccessOpCode:
 		{
 			var msg BetsRecvSuccess
-			return msg.readFrom(reader)
+			err := msg.readFrom(reader)
+			return &msg, err
 		}
 	case BetsRecvFailOpCode:
 		{
 			var msg BetsRecvFail
-			return msg.readFrom(reader)
+			err := msg.readFrom(reader)
+			return &msg, err
+		}
+	case WinnersOpCode:
+		{
+			var msg Winners
+			err := msg.readFrom(reader)
+			return &msg, err
 		}
 	default:
 		return nil, &ProtocolError{"invalid opcode", opcode}
