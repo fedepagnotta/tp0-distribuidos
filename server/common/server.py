@@ -70,6 +70,7 @@ class Server:
                 logging.error("action: apuesta_recibida | result: fail")
                 logging.error("action: receive_message | result: fail | error: %s", e)
             except EOFError:
+                client_sock.close()
                 break
             except OSError as e:
                 logging.error("action: send_message | result: fail | error: %s", e)
