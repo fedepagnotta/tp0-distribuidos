@@ -162,7 +162,7 @@ func (c *Client) SendBets() {
 		<-readDone
 		return
 	case <-readDone:
-		if (rerr != nil && !errors.Is(rerr, io.EOF)) || msg.GetOpCode() == BetsRecvFailOpCode {
+		if (rerr != nil && !errors.Is(rerr, io.EOF)) || (msg != nil && msg.GetOpCode() == BetsRecvFailOpCode) {
 			log.Error("action: bets_enviadas | result: fail")
 			return
 		}
