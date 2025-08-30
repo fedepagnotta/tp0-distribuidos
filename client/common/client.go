@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -133,39 +134,69 @@ func (c *Client) SendBets() {
 		writeDone <- c.buildAndSendBatches(ctx, betsReader)
 	}()
 
-	if err = <-writeDone; err != nil && !errors.Is(err, context.Canceled) {
-		log.Errorf("action: send_bets | result: fail | error: %v", err)
-		return
-	}
-
-	if tcp, ok := c.conn.(*net.TCPConn); ok {
-		_ = tcp.CloseWrite()
-	}
-
 	reader := bufio.NewReader(c.conn)
 	readDone := make(chan struct{})
-	var msg Readable
-	var rerr error
 	go func() {
+	readerLoop:
 		for {
-			msg, rerr = ReadMessage(reader)
-			if rerr != nil {
+			msg, err := ReadMessage(reader)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				log.Errorf("action: leer_respuesta | result: fail | err: %v", err)
 				break
+			}
+			switch msg.GetOpCode() {
+			case BetsRecvSuccessOpCode:
+				log.Info("action: bets_enviadas | result: success")
+			case BetsRecvFailOpCode:
+				log.Error("action: bets_enviadas | result: fail")
+			case WinnersOpCode:
+				{
+					log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d", len(msg.(*Winners).List))
+					break readerLoop
+				}
 			}
 		}
 		close(readDone)
 	}()
 
+	if err = <-writeDone; err != nil && !errors.Is(err, context.Canceled) {
+		log.Errorf("action: send_bets | result: fail | error: %v", err)
+		return
+	}
+
+	if err == nil {
+		agencyId, err := strconv.Atoi(c.config.ID)
+		if err != nil {
+			log.Errorf("action: send_finished | result: fail | error: %v", err)
+			return
+		}
+
+		finishedMsg := Finished{int32(agencyId)}
+		if _, err := finishedMsg.WriteTo(c.conn); err != nil {
+			log.Errorf("action: send_finished | result: fail | error: %v", err)
+			return
+		}
+
+		log.Infof("action: send_finished | result: success | agencyId: %d", int32(agencyId))
+
+		reqMsg := RequestWinners{int32(agencyId)}
+		if _, err := reqMsg.WriteTo(c.conn); err != nil {
+			log.Errorf("action: send_request_winners | result: fail | error: %v", err)
+		}
+
+		log.Infof("action: send_request_winners | result: success | agencyId: %d", int32(agencyId))
+	}
 	select {
 	case <-ctx.Done():
 		_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		<-readDone
 		return
 	case <-readDone:
-		if (rerr != nil && !errors.Is(rerr, io.EOF)) || (msg != nil && msg.GetOpCode() == BetsRecvFailOpCode) {
-			log.Error("action: bets_enviadas | result: fail")
-			return
+		if tcp, ok := c.conn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
 		}
-		log.Info("action: bets_enviadas | result: success")
 	}
 }
