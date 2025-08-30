@@ -120,23 +120,30 @@ func AddBetWithFlush(bet map[string]string, to *bytes.Buffer, finalOutput io.Wri
 		*betsCounter++
 		return nil
 	}
-	if err := binary.Write(finalOutput, binary.LittleEndian, NewBetsOpCode); err != nil {
+	if err := FlushBatch(to, finalOutput, *betsCounter); err != nil {
 		return err
 	}
-	if err := binary.Write(finalOutput, binary.LittleEndian, int32(4+to.Len())); err != nil {
-		return err
-	}
-	if err := binary.Write(finalOutput, binary.LittleEndian, *betsCounter); err != nil {
-		return err
-	}
-	if _, err := io.Copy(finalOutput, to); err != nil {
-		return err
-	}
-	to.Reset()
 	if err := writeStringMap(to, bet); err != nil {
 		return err
 	}
 	*betsCounter = 1
+	return nil
+}
+
+func FlushBatch(batch *bytes.Buffer, out io.Writer, betsCounter int32) error {
+	if err := binary.Write(out, binary.LittleEndian, NewBetsOpCode); err != nil {
+		return err
+	}
+	if err := binary.Write(out, binary.LittleEndian, int32(4+batch.Len())); err != nil {
+		return err
+	}
+	if err := binary.Write(out, binary.LittleEndian, betsCounter); err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, batch); err != nil {
+		return err
+	}
+	batch.Reset()
 	return nil
 }
 
