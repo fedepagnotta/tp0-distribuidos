@@ -2,8 +2,13 @@ package common
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/csv"
+	"errors"
+	"io"
 	"net"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -17,6 +22,8 @@ var log = logging.MustGetLogger("log")
 type ClientConfig struct {
 	ID            string
 	ServerAddress string
+	BetsFilePath  string
+	BatchLimit    int32
 }
 
 // Client Entity that encapsulates how
@@ -32,6 +39,55 @@ func NewClient(config ClientConfig) *Client {
 		config: config,
 	}
 	return client
+}
+
+func (c *Client) processNextBet(betsReader *csv.Reader, batchBuff *bytes.Buffer, betsCounter *int32) error {
+	betFields, err := betsReader.Read()
+	if err != nil {
+		return err
+	}
+	bet := map[string]string{
+		"AGENCIA":    c.config.ID,
+		"NOMBRE":     betFields[0],
+		"APELLIDO":   betFields[1],
+		"DOCUMENTO":  betFields[2],
+		"NACIMIENTO": betFields[3],
+		"NUMERO":     betFields[4],
+	}
+	if err := AddBetWithFlush(bet, batchBuff, c.conn, betsCounter, c.config.BatchLimit); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) buildAndSendBatches(ctx context.Context, betsReader *csv.Reader) error {
+	var batchBuff bytes.Buffer
+	var betsCounter int32 = 0
+	for {
+		select {
+		case <-ctx.Done():
+			if betsCounter > 0 {
+				if err := FlushBatch(&batchBuff, c.conn, betsCounter); err != nil {
+					return err
+				}
+				betsCounter = 0
+			}
+			return ctx.Err()
+		default:
+		}
+		if err := c.processNextBet(betsReader, &batchBuff, &betsCounter); err != nil {
+			if errors.Is(err, io.EOF) {
+				if betsCounter > 0 {
+					if err := FlushBatch(&batchBuff, c.conn, betsCounter); err != nil {
+						return err
+					}
+				}
+				break
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // CreateClientSocket Initializes client socket. In case of
@@ -52,60 +108,59 @@ func (c *Client) createClientSocket() error {
 }
 
 // SendBet Sends bet with the received parameters to the server, and waits for a response (success or fail)
-func (c *Client) SendBet(name string, lastName string, dni string, birthDate string, number string) {
+func (c *Client) SendBets() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
 
-	select {
-	case <-ctx.Done():
+	betsFile, err := os.Open(c.config.BetsFilePath)
+	if err != nil {
+		log.Criticalf("action: read_bets | result: fail | error: %v", err)
 		return
-	default:
 	}
+	defer betsFile.Close()
+
+	betsReader := csv.NewReader(betsFile)
+	betsReader.Comma = ','
+	betsReader.FieldsPerRecord = 5
 
 	if err := c.createClientSocket(); err != nil {
 		return
 	}
+	defer c.conn.Close()
 
-	reader := bufio.NewReader(c.conn)
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- c.buildAndSendBatches(ctx, betsReader)
+	}()
 
-	bets := NewBets{
-		Bets: []map[string]string{
-			{
-				"AGENCIA":    c.config.ID,
-				"NOMBRE":     name,
-				"APELLIDO":   lastName,
-				"DOCUMENTO":  dni,
-				"NACIMIENTO": birthDate,
-				"NUMERO":     number,
-			},
-		},
-	}
-	if _, err := bets.WriteTo(c.conn); err != nil {
-		log.Errorf("action: apuesta_enviada | result: fail | dni: %s | numero: %s", dni, number)
-		_ = c.conn.Close()
+	if err = <-writeDone; err != nil && !errors.Is(err, context.Canceled) {
+		log.Errorf("action: send_bets | result: fail | error: %v", err)
 		return
 	}
 
+	if tcp, ok := c.conn.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
+
+	reader := bufio.NewReader(c.conn)
 	readDone := make(chan struct{})
 	var msg Readable
-	var err error
+	var rerr error
 	go func() {
-		msg, err = ReadMessage(reader)
+		msg, rerr = ReadMessage(reader)
 		close(readDone)
 	}()
 
 	select {
 	case <-ctx.Done():
-		_ = c.conn.SetReadDeadline(time.Now())
+		_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		<-readDone
-		c.conn.Close()
 		return
 	case <-readDone:
-		c.conn.Close()
-		if err != nil || msg.GetOpCode() == BetsRecvFailOpCode {
-			log.Errorf("action: apuesta_enviada | result: fail | dni: %s | numero: %s", dni, number)
+		if rerr != nil || msg.GetOpCode() == BetsRecvFailOpCode {
+			log.Error("action: bets_enviadas | result: fail")
 			return
 		}
-		log.Infof("action: apuesta_enviada | result: success | dni: %s | numero: %s", dni, number)
+		log.Info("action: bets_enviadas | result: success")
 	}
 }
