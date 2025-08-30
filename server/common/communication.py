@@ -16,6 +16,9 @@ class Opcodes:
     NEW_BETS = 0
     BETS_RECV_SUCCESS = 1
     BETS_RECV_FAIL = 2
+    FINISHED = 3
+    REQUEST_WINNERS = 4
+    WINNERS = 5
 
 
 class NewBets:
@@ -31,15 +34,6 @@ class NewBets:
             "NUMERO",
         )
         self.amount: int = 0
-
-    def process(self):
-        utils.store_bets(self.bets)
-        for bet in self.bets:
-            logging.info(
-                "action: apuesta_almacenada | result: success | dni: %s | numero: %s",
-                bet.document,
-                bet.number,
-            )
 
     def __read_pair(self, sock: socket.socket, remaining: int) -> tuple[str, str, int]:
         (key, remaining) = read_string(sock, remaining, self.opcode)
@@ -89,6 +83,32 @@ class NewBets:
             if remaining > 0:
                 _ = recv_exactly(sock, remaining)
             raise
+
+
+class Finished:
+    def __init__(self):
+        self.opcode = Opcodes.FINISHED
+        self.agency_id = None
+        self._length = 4
+
+    def read_from(self, sock: socket.socket, length: int):
+        if length != self._length:
+            raise ProtocolError("invalid length", self.opcode)
+        (agency_id, _) = read_i32(sock, length, self.opcode)
+        self.agency_id = agency_id
+
+
+class RequestWinners:
+    def __init__(self):
+        self.opcode = Opcodes.REQUEST_WINNERS
+        self.agency_id = None
+        self._length = 4
+
+    def read_from(self, sock: socket.socket, length: int):
+        if length != self._length:
+            raise ProtocolError("invalid length", self.opcode)
+        (agency_id, _) = read_i32(sock, length, self.opcode)
+        self.agency_id = agency_id
 
 
 def recv_exactly(sock: socket.socket, n: int) -> bytes:
@@ -155,11 +175,18 @@ def recv_msg(sock: socket.socket):
     if length < 0:
         raise ProtocolError("invalid length")
     if opcode == Opcodes.NEW_BETS:
-        new_bets = NewBets()
-        new_bets.read_from(sock, length)
-        return new_bets
-    else:
-        raise ProtocolError(f"invalid opcode: {opcode}")
+        msg = NewBets()
+        msg.read_from(sock, length)
+        return msg
+    if opcode == Opcodes.FINISHED:
+        msg = Finished()
+        msg.read_from(sock, length)
+        return msg
+    if opcode == Opcodes.REQUEST_WINNERS:
+        msg = RequestWinners()
+        msg.read_from(sock, length)
+        return msg
+    raise ProtocolError(f"invalid opcode: {opcode}")
 
 
 def write_struct(sock: socket.socket, fmt: str, *values) -> None:
@@ -173,6 +200,13 @@ def write_u8(sock: socket.socket, value: int) -> None:
 
 def write_i32(sock: socket.socket, value: int) -> None:
     write_struct(sock, "<i", value)
+
+
+def write_string(sock: socket.socket, s: str) -> None:
+    b = s.encode("utf-8")
+    n = len(b)
+    write_i32(sock, n)
+    sock.sendall(b)
 
 
 class BetsRecvSuccess:
@@ -191,3 +225,19 @@ class BetsRecvFail:
     def write_to(self, sock: socket.socket):
         write_u8(sock, self.opcode)
         write_i32(sock, 0)
+
+
+class Winners:
+    def __init__(self, winners: list[str]):
+        self.opcode = Opcodes.WINNERS
+        self.list = winners
+
+    def write_to(self, sock: socket.socket):
+        body_length = 4
+        for document in self.list:
+            body_length += 4 + len(document)
+        write_u8(sock, self.opcode)
+        write_i32(sock, body_length)
+        write_i32(sock, len(self.list))
+        for document in self.list:
+            write_string(sock, document)
