@@ -250,16 +250,15 @@ func (msg *Winners) readFrom(reader *bufio.Reader) error {
 		if remaining < strLen {
 			return &ProtocolError{"invalid body length", msg.GetOpCode()}
 		}
-		buf := make([]byte, strLen)
+		buf := make([]byte, int(strLen))
 		if _, err := io.ReadFull(reader, buf); err != nil {
 			return err
 		}
 		remaining -= strLen
-		if remaining != 0 {
-			return &ProtocolError{"invalid body length", msg.GetOpCode()}
-		}
-
 		msg.List = append(msg.List, string(buf))
+	}
+	if remaining != 0 {
+		return &ProtocolError{"invalid body length", msg.GetOpCode()}
 	}
 	return nil
 }
