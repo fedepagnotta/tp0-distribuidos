@@ -868,7 +868,7 @@ Se agrega una nueva notación para describir el formato del body: \[string list]
 
 Se agregan tres mensajes nuevos:
 
-- `FINISH`, con opcode **3**, que utilizará el cliente para avisar al servidor que terminó con la entrega de todos los batches. El body es un \[int] que contendrá el ID de la agencia.
+- `FINISHED`, con opcode **3**, que utilizará el cliente para avisar al servidor que terminó con la entrega de todos los batches. El body es un \[int] que contendrá el ID de la agencia.
 - `REQUEST_WINNERS`, con opcode **4**, que utilizará el cliente para solicitar los ganadores correspondientes a su agencia. El body es un \[int]
   que contendrá el ID de la agencia.
 - `WINNERS`, con opcode **5**, que utilizará el server para notificar los ganadores correspondientes a cada agencia. El body es un \[string list],
@@ -1013,12 +1013,6 @@ class Winners:
             write_string(sock, document)  # sendall
 ```
 
-**5) Supuesto explícito sobre la cantidad de agencias**
-Se **presupone que siempre hay exactamente 5 agencias**; por eso el sorteo se dispara al alcanzar:
-
-```python
-if len(self._finished) == 5 and not self._raffle_done:
-    self.__raffle()
-```
-
-y solo después de ese evento se responden los `REQUEST_WINNERS` válidos.
+**5) Cantidad de agencias**
+La cantidad de agencias es configurable en el script `generar-compose.sh`, ya que se pasa el segundo parámetro del mismo como variable de entorno al servicio del server,
+que utiliza esta variable para saber cuántos mensajes `Finished` debe esperar para hacer el sorteo.

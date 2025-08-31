@@ -6,7 +6,7 @@ from common import communication, utils
 
 
 class Server:
-    def __init__(self, port, listen_backlog):
+    def __init__(self, port, listen_backlog, clients_amount):
         # Initialize server socket
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.bind(("", port))
@@ -15,6 +15,7 @@ class Server:
         self._finished: set[int] = set()
         self._winners: dict[int, list[str]] = {}
         self._raffle_done: bool = False
+        self._clients_amount = int(clients_amount)
 
     def run(self):
         """
@@ -85,7 +86,7 @@ class Server:
             return True
         if msg.opcode == communication.Opcodes.FINISHED:
             self._finished.add(msg.agency_id)
-            if len(self._finished) == 5 and not self._raffle_done:
+            if len(self._finished) == self._clients_amount and not self._raffle_done:
                 self.__raffle()
             return False
         if msg.opcode == communication.Opcodes.REQUEST_WINNERS:
