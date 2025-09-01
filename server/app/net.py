@@ -2,12 +2,11 @@ import logging
 import signal
 import socket
 
-from common import communication, utils
+from app import protocol, service
 
 
 class Server:
     def __init__(self, port, listen_backlog):
-        # Initialize server socket
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.bind(("", port))
         self._server_socket.listen(listen_backlog)
@@ -15,11 +14,11 @@ class Server:
 
     def run(self):
         """
-        Dummy Server loop
+        Main server loop.
 
-        Server that accept a new connections and establishes a
-        communication with a client. After client with communucation
-        finishes, servers starts to accept new connections again
+        Accepts connections sequentially until SIGTERM is received.
+        On SIGTERM, closes the listening socket to unblock accept(),
+        drains the loop, and finally calls logging.shutdown().
         """
         self._running = True
         signal.signal(signal.SIGTERM, self.__stop_running)
@@ -34,37 +33,52 @@ class Server:
         logging.shutdown()
 
     def __handle_client_connection(self, client_sock):
+        """
+        Handles a single connection.
+
+        Reads one NEW_BETS message. If bets are persisted successfully,
+        replies BETS_RECV_SUCCESS and logs:
+          action: apuesta_recibida | result: success | cantidad: <amount>
+        Also logs one 'apuesta_almacenada' per bet. On any protocol/storage
+        error, replies BETS_RECV_FAIL (best effort) and logs 'fail'. Closes
+        the socket before returning.
+        """
         while True:
             msg = None
             try:
-                msg = communication.recv_msg(client_sock)
+                msg = protocol.recv_msg(client_sock)
                 addr = client_sock.getpeername()
                 logging.info(
                     "action: receive_message | result: success | ip: %s | opcode: %i",
                     addr[0],
                     msg.opcode,
                 )
-
                 try:
-                    msg.process()
-                except Exception as e:
+                    service.store_bets(msg.bets)
+                    for b in msg.bets:
+                        logging.info(
+                            "action: apuesta_almacenada | result: success | dni: %s | numero: %s",
+                            b.document,
+                            b.number,
+                        )
+                except OSError as e:
                     logging.error("action: process_bets | result: fail | error: %s", e)
-                    communication.BetsRecvFail().write_to(client_sock)
+                    protocol.BetsRecvFail().write_to(client_sock)
                     logging.error(
                         "action: apuesta_recibida | result: fail | cantidad: %i",
                         getattr(msg, "amount", 0),
                     )
                     continue
 
-                communication.BetsRecvSuccess().write_to(client_sock)
+                protocol.BetsRecvSuccess().write_to(client_sock)
                 logging.info(
                     "action: apuesta_recibida | result: success | cantidad: %i",
                     msg.amount,
                 )
 
-            except communication.ProtocolError as e:
+            except protocol.ProtocolError as e:
                 try:
-                    communication.BetsRecvFail().write_to(client_sock)
+                    protocol.BetsRecvFail().write_to(client_sock)
                 except Exception as e1:
                     logging.error("action: send_message | result: fail | error: %s", e1)
                 logging.error("action: apuesta_recibida | result: fail")
@@ -80,17 +94,21 @@ class Server:
 
     def __accept_new_connection(self):
         """
-        Accept new connections
+        Accept new connections.
 
-        Function blocks until a connection to a client is made.
-        Then connection created is printed and returned
+        Blocks until a client connects.
+        Logs the client IP and returns the accepted socket.
         """
-        # Connection arrived
         logging.info("action: accept_connections | result: in_progress")
         c, addr = self._server_socket.accept()
         logging.info(f"action: accept_connections | result: success | ip: {addr[0]}")
         return c
 
     def __stop_running(self, _signum, _frame):
+        """SIGTERM handler.
+
+        Marks the server as stopping and closes the listening socket
+        to wake up accept().
+        """
         self._running = False
         self._server_socket.close()

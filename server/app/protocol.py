@@ -1,9 +1,6 @@
-import logging
 import socket
 import struct
 from typing import Tuple
-
-from common import utils
 
 
 class ProtocolError(Exception):
@@ -18,9 +15,27 @@ class Opcodes:
     BETS_RECV_FAIL = 2
 
 
+class RawBet:
+    def __init__(
+        self,
+        agency: str,
+        first_name: str,
+        last_name: str,
+        document: str,
+        birthdate: str,
+        number: str,
+    ):
+        self.agency = agency
+        self.first_name = first_name
+        self.last_name = last_name
+        self.document = document
+        self.birthdate = birthdate
+        self.number = number
+
+
 class NewBets:
     def __init__(self):
-        self.bets: list[utils.Bet] = []
+        self.bets: list[RawBet] = []
         self.opcode: int = Opcodes.NEW_BETS
         self.required = (
             "AGENCIA",
@@ -30,16 +45,6 @@ class NewBets:
             "NACIMIENTO",
             "NUMERO",
         )
-        self.amount: int = 0
-
-    def process(self):
-        utils.store_bets(self.bets)
-        for bet in self.bets:
-            logging.info(
-                "action: apuesta_almacenada | result: success | dni: %s | numero: %s",
-                bet.document,
-                bet.number,
-            )
 
     def __read_pair(self, sock: socket.socket, remaining: int) -> tuple[str, str, int]:
         (key, remaining) = read_string(sock, remaining, self.opcode)
@@ -51,16 +56,13 @@ class NewBets:
         (n_pairs, remaining) = read_i32(sock, remaining, self.opcode)
         if n_pairs != 6:
             raise ProtocolError("invalid body", self.opcode)
-
-        for _ in range(n_pairs):
+        for _ in range(0, n_pairs):
             (k, v, remaining) = self.__read_pair(sock, remaining)
             curr_bet[k] = v
-
         if [k for k in self.required if k not in curr_bet]:
             raise ProtocolError("invalid body", self.opcode)
-
-        try:
-            bet = utils.Bet(
+        self.bets.append(
+            RawBet(
                 curr_bet["AGENCIA"],
                 curr_bet["NOMBRE"],
                 curr_bet["APELLIDO"],
@@ -68,32 +70,33 @@ class NewBets:
                 curr_bet["NACIMIENTO"],
                 curr_bet["NUMERO"],
             )
-        except (ValueError, TypeError) as e:
-            raise ProtocolError("invalid body", self.opcode) from e
-
-        self.bets.append(bet)
+        )
         return remaining
 
-    def read_from(self, sock, length: int):
+    def read_from(self, sock: socket.socket, length: int):
+        """
+        Parses the NEW_BETS body
+
+        First an int32 with the number of bets, then for each bet a
+        [string map] with exactly 6 key/value pairs
+        (AGENCIA, NOMBRE, APELLIDO, DOCUMENTO, NACIMIENTO, NUMERO).
+        Checks that the specified length is correct.
+        """
         remaining = length
-        try:
-            n_bets, remaining = read_i32(sock, remaining, self.opcode)
-            self.amount = n_bets
-            for _ in range(n_bets):
-                remaining = self.__read_bet(sock, remaining)
-            if remaining != 0:
-                raise ProtocolError(
-                    "indicated length doesn't match body length", self.opcode
-                )
-        except ProtocolError:
-            if remaining > 0:
-                _ = recv_exactly(sock, remaining)
-            raise
+        (n_bets, remaining) = read_i32(sock, remaining, self.opcode)
+        for _ in range(0, n_bets):
+            remaining = self.__read_bet(sock, remaining)
+        if remaining != 0:
+            raise ProtocolError(
+                "indicated length doesn't match body length", self.opcode
+            )
 
 
 def recv_exactly(sock: socket.socket, n: int) -> bytes:
     """
-    Reads exactly n bytes or throws EOFError if peer closed before finishing.
+    Reads exactly n bytes from the socket (retrying as needed) or raises
+    EOFError if the peer closes first.
+    Converts timeouts/OS errors into ProtocolError. Prevents short reads.
     """
     if n < 0:
         raise ProtocolError("invalid body")
@@ -117,7 +120,8 @@ def recv_exactly(sock: socket.socket, n: int) -> bytes:
 
 def read_struct(sock: socket.socket, fmt: str) -> Tuple:
     """
-    Reads struct with endianness and types defined by fmt.
+    Reads the exact number of bytes required by 'fmt' (struct.calcsize),
+    then unpacks them using little-endian formats.
     """
     size = struct.calcsize(fmt)
     buf = recv_exactly(sock, size)
@@ -136,6 +140,11 @@ def read_i32(sock: socket.socket, remaining: int, opcode: int) -> (int, int):
 
 
 def read_string(sock: socket.socket, remaining: int, opcode: int) -> (str, int):
+    """
+    Reads a protocol [string]: int32 length (validated) followed
+    by UTF-8 bytes.
+    Returns the decoded string and the updated 'remaining' counter.
+    """
     (key_len, remaining) = read_i32(sock, remaining, opcode)
     if key_len <= 0:
         raise ProtocolError("invalid body", opcode)
@@ -150,6 +159,11 @@ def read_string(sock: socket.socket, remaining: int, opcode: int) -> (str, int):
 
 
 def recv_msg(sock: socket.socket):
+    """
+    Reads opcode (u8) and length (i32 LE), then dispatches to the appropriate
+    message class (currently only NEW_BETS). Validates 'length' and raises
+    ProtocolError for invalid opcodes.
+    """
     opcode = read_u8(sock)
     (length, _) = read_i32(sock, 4, -1)
     if length < 0:

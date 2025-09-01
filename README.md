@@ -766,96 +766,215 @@ El servidor se organiza en módulos con responsabilidades bien delimitadas:
 - **Manejo de Unicode:** los cuerpos de strings se decodifican en UTF-8; errores de decodificación se traducen a `ProtocolError("invalid body")`, manteniendo unívoca
   la semántica de error de protocolo.
 
-### Ejercicio N°6:
+### Ejercicio N°6
+
+**Estructura:** se mantiene la separación de responsabilidades de E5: el **cliente** se encarga de conexión + batching; el **servidor** de aceptar sockets,
+parsear frames y persistir; el **módulo de protocolo** define el <!-- wire  -->format y las primitivas de (de)serialización.
+
+---
 
 #### Cliente
 
-La solución implementa **envío por lotes (batching)**, respetando el framing del protocolo y el límite de 8 KiB. Para cada apuesta, el cliente serializa un `string map` y lo acumula en un `bytes.Buffer`. Antes de agregar una apuesta, se verifica si el paquete resultante superaría `8*1024` bytes (incluyendo `opcode(1) + length(4) + n(4)`) o el `batchLimit`. Si no entra, se **emite el batch actual** y se inicia uno nuevo con la apuesta en curso. Al finalizar el archivo o ante cancelación, se realiza **flush** del batch pendiente.
+**Flujo general**
 
-El envío de un paquete sigue exactamente el formato del protocolo: `opcode | length | n | body`, donde `length` es el tamaño en bytes del **body** y `n` la cantidad de apuestas. Se utiliza `io.Copy` para volcar el cuerpo al socket, lo que garantiza que **no haya short writes**, ya que `io.Copy` reintenta internamente hasta completar la escritura de todos los bytes (salvo error). De manera análoga, el encabezado (`opcode`, `length`, `n`) se emite con escrituras fijas de 1 y 4 bytes en little-endian.
+1. Lee el CSV de la agencia y **acumula apuestas** en memoria.
+2. Antes de agregar cada apuesta al cuerpo del batch, verifica dos límites:
+   - **Tamaño máximo de paquete:** no exceder **8 KiB** incluyendo `opcode(1) + length(4) + n(4) + body`.
+   - **Cantidad máxima por batch:** `BatchLimit` (desde `config.yaml`).
 
-Ejemplo representativo del envío del batch:
+3. Si al sumar la apuesta actual se excede alguno de los límites, **emite el batch** (flush), vacía el buffer y comienza un batch nuevo con la apuesta actual.
+4. Al terminar el archivo (o si el contexto se cancela), hace **flush final** si queda contenido pendiente.
+5. Cierra el lado de escritura del TCP (`CloseWrite`) y **lee todas las respuestas** del servidor hasta EOF. Loguea _success_ sólo si la última
+   respuesta fue `BETS_RECV_SUCCESS` y no hubo errores de lectura.
+
+**Piezas clave**
+
+- **Acumulación + decisión de flush**
 
 ```go
-if err := binary.Write(finalOutput, binary.LittleEndian, NewBetsOpCode); err != nil { return err }
-if err := binary.Write(finalOutput, binary.LittleEndian, int32(4+to.Len())); err != nil { return err }
-if err := binary.Write(finalOutput, binary.LittleEndian, *betsCounter); err != nil { return err }
-if _, err := io.Copy(finalOutput, to); err != nil { return err }
+// Serializa la apuesta y decide si entra en el batch actual.
+// Si no entra (por tamaño o cantidad), flushea y comienza un batch nuevo.
+func AddBetWithFlush(bet map[string]string, to *bytes.Buffer, out io.Writer,
+    betsCounter *int32, batchLimit int32) error {
+
+    var encoded bytes.Buffer
+    if err := writeStringMap(&encoded, bet); err != nil {
+        return err
+    }
+    // 1 (opcode) + 4 (length) + 4 (nBets)
+    const headerOverhead = 1 + 4 + 4
+    fitsSize := to.Len()+encoded.Len()+headerOverhead <= 8*1024
+    fitsCount := *betsCounter+1 <= batchLimit
+
+    if fitsSize && fitsCount {
+        _, _ = io.Copy(to, &encoded)
+        *betsCounter++
+        return nil
+    }
+    if err := FlushBatch(to, out, *betsCounter); err != nil {
+        return err
+    }
+    if err := writeStringMap(to, bet); err != nil {
+        return err
+    }
+    *betsCounter = 1
+    return nil
+}
 ```
 
-Para la **recepción de la respuesta** del servidor, se corre una goroutine que realiza la lectura con un `bufio.Reader` y se sincroniza mediante un canal (`readDone`). El `bufio.Reader` y la decodificación por framing ocultan **short reads** de la capa TCP: si el SO entrega menos bytes en una llamada, la lectura continúa hasta completar el mensaje.
-
-El **graceful shutdown** del cliente se instrumenta con `signal.NotifyContext` sobre `SIGTERM`. Cuando llega la señal durante el envío o la espera de respuesta:
-
-- En el camino de **escritura**, el proceso de “build & flush” chequea `ctx.Done()` en cada iteración y, si el contexto se cancela, **flushea el batch parcial** y retorna.
-- En el camino de **lectura**, al activarse el `select` por `ctx.Done()` se **cierra la mitad de escritura** para señalar EOF al servidor y se establece un **deadline de lectura** breve para desbloquear la goroutine lectora; luego se espera a `readDone` y se termina ordenadamente.
-
-Fragmento relevante del manejo de señal en la espera de respuesta:
+- **Emisión del batch (framing exacto)**
 
 ```go
-case <-ctx.Done():
-    if tcp, ok := c.conn.(*net.TCPConn); ok {
-        _ = tcp.CloseWrite()
+func FlushBatch(body *bytes.Buffer, out io.Writer, nBets int32) error {
+    // opcode
+    if err := binary.Write(out, binary.LittleEndian, NewBetsOpCode); err != nil { return err }
+    // length = 4 (nBets) + body.Len()
+    if err := binary.Write(out, binary.LittleEndian, int32(4+body.Len())); err != nil { return err }
+    // nBets
+    if err := binary.Write(out, binary.LittleEndian, nBets); err != nil { return err }
+    // body
+    if _, err := io.Copy(out, body); err != nil { return err }
+    body.Reset()
+    return nil
+}
+```
+
+> **Short write:** evitado porque todas las escrituras del cuerpo se hacen con `io.Copy`/`bytes.Buffer.WriteTo`, que reintentan hasta completar o fallar.
+
+- **Recepción de respuestas y _graceful shutdown_**
+
+```go
+// Tras enviar, cierro escritura para que el server detecte EOF y me responda todo.
+if tcp, ok := c.conn.(*net.TCPConn); ok {
+    _ = tcp.CloseWrite()
+}
+
+reader := bufio.NewReader(c.conn)
+readDone := make(chan struct{})
+var last Readable
+var rerr error
+
+go func() {
+    for {
+        last, rerr = ReadMessage(reader)
+        if rerr != nil {
+            break
+        }
     }
+    close(readDone)
+}()
+
+select {
+case <-ctx.Done():
+    // Desbloquea la lectura y termina ordenado
     _ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
     <-readDone
     return
+case <-readDone:
+    if (rerr != nil && !errors.Is(rerr, io.EOF)) ||
+       (last != nil && last.GetOpCode() == BetsRecvFailOpCode) {
+        log.Error("action: bets_enviadas | result: fail")
+        return
+    }
+    log.Info("action: bets_enviadas | result: success")
+}
 ```
 
-Con este flujo, el cliente garantiza: (a) batching con límite de tamaño y cantidad, (b) emisión exacta conforme al framing, (c) **ausencia de short writes** (`io.Copy`) y **short reads** percibidos por la lógica de aplicación (`bufio.Reader`), y (d) **terminación ordenada** ante `SIGTERM`, drenando lo pendiente y sin dejar operaciones bloqueadas.
+> **Short read:** oculto a la lógica de aplicación gracias al framing y al `bufio.Reader`; si TCP entrega menos bytes, el parser sigue leyendo hasta completar
+> el frame o falla.
 
 ---
 
 #### Servidor
 
-El servidor acepta conexiones y, para cada socket de cliente, procesa **múltiples mensajes** en un loop. La deserialización cumple el framing del protocolo:
+**Flujo general**
 
-1. Se lee `opcode` (`u8`) y `length` (`i32 LE`).
-2. Para `NEW_BETS`, se lee `n` (`i32 LE`) y luego `n` apuestas, cada una como `n_pairs` (`i32 LE`) seguido de `n_pairs` pares `<string, string>` en UTF-8, con longitudes prefijadas en little-endian.
-3. Ante **cualquier inconsistencia** del body (por ejemplo `n_pairs != 6`, claves faltantes, tamaños inválidos o errores de decodificación), se **descarta el batch completo**, tal como exige la modalidad “all-or-nothing”.
+- Acepta conexiones de forma **secuencial** (como en E5).
+- Por cada socket, **lee un mensaje** `NEW_BETS`, valida y decodifica el batch, intenta **persistir todas las apuestas** y responde:
+  - `BETS_RECV_SUCCESS` si **todas** se procesaron ok.
+  - `BETS_RECV_FAIL` si ocurre **cualquier** error de framing/validación/persistencia.
 
-Para **evitar short reads**, la lectura del body se hace con una primitiva de exactitud:
+- Loguea por cada apuesta persistida y un resumen por batch (success/fail con la cantidad).
+
+**Piezas clave**
+
+- **Lectura exacta del cuerpo** (_short read_‐safe):
 
 ```python
 def recv_exactly(sock: socket.socket, n: int) -> bytes:
-    data = bytearray(n)
-    view = memoryview(data)
+    """Reads exactly n bytes or raises on premature EOF."""
+    if n < 0:
+        raise ProtocolError("invalid body")
+    buf = bytearray(n)
+    view = memoryview(buf)
     read = 0
     while read < n:
         nrecv = sock.recv_into(view[read:], n - read)
         if nrecv == 0:
             raise EOFError("peer closed connection")
         read += nrecv
-    return bytes(data)
+    return bytes(buf)
 ```
 
-Esta función itera hasta completar exactamente `n` bytes o aborta; de ese modo, un retorno parcial de `recv` no se propaga a la lógica de decodificación. Cuando durante la lectura del body ocurre un error de framing o contenido, el servidor **drena los bytes restantes** del body antes de re-lanzar, dejando el stream **resíncronizado** para el siguiente mensaje o cierre de conexión.
+- **Framing + validación “todo-o-nada”** (mapas con claves requeridas):
 
-Las respuestas siguen el contrato “todo o nada”: si el batch se decodifica y procesa sin errores, se envía `BETS_RECV_SUCCESS`; si se detecta cualquier problema en la decodificación o durante la validación de las apuestas, se responde `BETS_RECV_FAIL`. El envío de respuestas utiliza `sendall`, que garantiza que **no haya short writes** a nivel de aplicación:
+```python
+def recv_msg(sock: socket.socket):
+    opcode = read_u8(sock)
+    (length, _) = read_i32(sock, 4, -1)
+    if length < 0:
+        raise ProtocolError("invalid length")
+    if opcode == Opcodes.NEW_BETS:
+        msg = NewBets()
+        msg.read_from(sock, length)   # consume exactamente 'length' bytes
+        return msg
+    raise ProtocolError(f"invalid opcode: {opcode}")
+```
+
+La clase `NewBets` exige exactamente **6 pares `<k,v>`** por apuesta y la presencia de las claves: `AGENCIA, NOMBRE, APELLIDO, DOCUMENTO, NACIMIENTO, NUMERO`.
+Ante cualquier inconsistencia, **descarta el batch completo** (responde _fail_).
+
+- **Respuestas sin _short write_**:
 
 ```python
 def write_struct(sock: socket.socket, fmt: str, *values) -> None:
     data = struct.pack(fmt, *values)
-    sock.sendall(data)
+    sock.sendall(data)   # garantiza escritura completa o excepción
 ```
 
-El **graceful shutdown** del servidor se implementa con un flag `_running` y un handler de `SIGTERM`. Al recibir la señal, el handler marca `_running = False` y **cierra el socket de escucha**. El cierre del listener provoca que `accept()` falle con `OSError`; el loop principal detecta que `_running` ya es `False` y sale sin aceptar nuevas conexiones, **drenando** antes la conexión en curso. Finalmente, se ejecuta `logging.shutdown()` para asegurar el vaciado de buffers de log.
-
-Versión final del ciclo principal, coherente con el esquema de drenado:
+- **Logging y contrato de batch**:
 
 ```python
-def run(self):
-    self._running = True
-    signal.signal(signal.SIGTERM, self.__stop_running)
-    while self._running:
-        try:
-            client_sock = self.__accept_new_connection()
-            self.__handle_client_connection(client_sock)
-        except OSError:
-            if not self._running:
-                break
-            raise
-    logging.shutdown()
+try:
+    service.store_bets(msg.bets)
+    for b in msg.bets:
+        logging.info(
+            "action: apuesta_almacenada | result: success | dni: %s | numero: %s",
+            b.document, b.number,
+        )
+    protocol.BetsRecvSuccess().write_to(client_sock)
+    logging.info(
+        "action: apuesta_recibida | result: success | cantidad: %i", msg.amount
+    )
+except Exception as e:
+    protocol.BetsRecvFail().write_to(client_sock)
+    logging.error(
+        "action: apuesta_recibida | result: fail | cantidad: %i", getattr(msg, "amount", 0)
+    )
 ```
 
-En conjunto, el servidor garantiza: (a) deserialización exacta y validación integral del **batch completo**, (b) **descartado total** ante la primera apuesta inválida, (c) **ausencia de short reads/writes** visibles para la lógica gracias a `recv_exactly` y `sendall`, y (d) **terminación ordenada** ante `SIGTERM`, sin aceptar nuevas conexiones y permitiendo que la última conexión activa finalice su procesamiento.
+- **Terminación ordenada (SIGTERM)**: igual que en E5. Un handler cierra el socket de escucha para **desbloquear `accept()`**; el loop verifica el flag y sale,
+  ejecutando por último `logging.shutdown()`.
+
+---
+
+#### Resumen
+
+- **Batching con límites**: tamaño total ≤ 8 KiB y `BatchLimit` configurable.
+- **Framing binario LE**: `opcode(1) | length(i32) | n(i32) | body`.
+- **Todo-o-nada**: el servidor sólo responde _success_ si **todas** las apuestas del batch se persistieron correctamente.
+- **Robustez I/O**: `io.Copy`/`sendall` evitan _short write_; `recv_exactly` y parsers con `remaining` evitan _short read_ y desalineaciones.
+- **Graceful shutdown** en cliente (contexto + deadlines) y servidor (SIGTERM + cierre del listener).
+
+Con esta versión, el sistema procesa archivos de apuestas por **lotes eficientes**, minimizando overhead de red, manteniendo la **integridad del protocolo**
+y cumpliendo exactamente con los logs que pide el enunciado.
