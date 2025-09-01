@@ -1,41 +1,113 @@
 import logging
 import signal
 import socket
+import threading
 
 from common import communication, utils
 
 
 class Server:
     def __init__(self, port, listen_backlog, clients_amount):
-        # Initialize server socket
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.bind(("", port))
         self._server_socket.listen(listen_backlog)
-        self._running = False
-        self._finished: set[int] = set()
+        self._stop = threading.Event()
+        self._finished = threading.Barrier(clients_amount)
         self._winners: dict[int, list[str]] = {}
         self._raffle_done: bool = False
-        self._clients_amount = int(clients_amount)
+        self._raffle_lock = threading.Lock()
+        self._storage_lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
 
     def run(self):
-        """
-        Dummy Server loop
-
-        Server that accept a new connections and establishes a
-        communication with a client. After client with communucation
-        finishes, servers starts to accept new connections again
-        """
-        self._running = True
-        signal.signal(signal.SIGTERM, self.__stop_running)
-        while self._running:
+        signal.signal(signal.SIGTERM, self.__handle_sigterm)
+        while not self._stop.is_set():
             try:
                 client_sock = self.__accept_new_connection()
-                self.__handle_client_connection(client_sock)
+                t = threading.Thread(
+                    target=self.__handle_client_connection, args=(client_sock,)
+                )
+                self._threads.append(t)
+                t.start()
             except OSError:
-                if not self._running:
+                if self._stop.is_set():
                     break
                 raise
+        for t in self._threads:
+            t.join()
         logging.shutdown()
+
+    def __accept_new_connection(self):
+        """
+        Accept new connections
+
+        Function blocks until a connection to a client is made.
+        Then connection created is printed and returned
+        """
+        # Connection arrived
+        logging.info("action: accept_connections | result: in_progress")
+        c, addr = self._server_socket.accept()
+        logging.info(f"action: accept_connections | result: success | ip: {addr[0]}")
+        return c
+
+    def __handle_client_connection(self, client_sock):
+        while not self._stop.is_set():
+            msg = None
+            try:
+                msg = communication.recv_msg(client_sock)
+                addr = client_sock.getpeername()
+                logging.info(
+                    "action: receive_message | result: success | ip: %s | opcode: %i",
+                    addr[0],
+                    msg.opcode,
+                )
+                if not self.__process_msg(msg, client_sock):
+                    break
+            except communication.ProtocolError as e:
+                logging.error("action: receive_message | result: fail | error: %s", e)
+            except EOFError:
+                break
+            except OSError as e:
+                logging.error("action: send_message | result: fail | error: %s", e)
+                break
+        client_sock.close()
+
+    def __process_msg(self, msg, client_sock) -> bool:
+        if msg.opcode == communication.Opcodes.NEW_BETS:
+            try:
+                with self._storage_lock:
+                    utils.store_bets(msg.bets)
+                    for bet in msg.bets:
+                        logging.info(
+                            "action: apuesta_almacenada | result: success | dni: %s | numero: %s",
+                            bet.document,
+                            bet.number,
+                        )
+            except Exception as e:
+                communication.BetsRecvFail().write_to(client_sock)
+                logging.error(
+                    "action: apuesta_recibida | result: fail | cantidad: %d", msg.amount
+                )
+                return True
+            logging.info(
+                "action: apuesta_recibida | result: success | cantidad: %d",
+                msg.amount,
+            )
+            communication.BetsRecvSuccess().write_to(client_sock)
+            return True
+        if msg.opcode == communication.Opcodes.FINISHED:
+            self._finished.wait()
+            with self._raffle_lock:
+                if not self._raffle_done:
+                    self.__raffle()
+            return True
+        if msg.opcode == communication.Opcodes.REQUEST_WINNERS:
+            with self._raffle_lock:
+                ready = self._raffle_done
+            if ready:
+                self.__send_winners(msg.agency_id, client_sock)
+                return False
+            return True
 
     def __raffle(self):
         try:
@@ -62,73 +134,6 @@ class Server:
                 e,
             )
 
-    def __process_msg(self, msg, client_sock: socket.socket) -> bool:
-        if msg.opcode == communication.Opcodes.NEW_BETS:
-            try:
-                utils.store_bets(msg.bets)
-                for bet in msg.bets:
-                    logging.info(
-                        "action: apuesta_almacenada | result: success | dni: %s | numero: %s",
-                        bet.document,
-                        bet.number,
-                    )
-            except Exception as e:
-                communication.BetsRecvFail().write_to(client_sock)
-                logging.error(
-                    "action: apuesta_recibida | result: fail | cantidad: %d", msg.amount
-                )
-                return True
-            logging.info(
-                "action: apuesta_recibida | result: success | cantidad: %d",
-                msg.amount,
-            )
-            communication.BetsRecvSuccess().write_to(client_sock)
-            return True
-        if msg.opcode == communication.Opcodes.FINISHED:
-            self._finished.add(msg.agency_id)
-            if len(self._finished) == self._clients_amount and not self._raffle_done:
-                self.__raffle()
-            return False
-        if msg.opcode == communication.Opcodes.REQUEST_WINNERS:
-            if self._raffle_done and msg.agency_id in self._finished:
-                self.__send_winners(msg.agency_id, client_sock)
-            return False
-
-    def __handle_client_connection(self, client_sock):
-        while True:
-            msg = None
-            try:
-                msg = communication.recv_msg(client_sock)
-                addr = client_sock.getpeername()
-                logging.info(
-                    "action: receive_message | result: success | ip: %s | opcode: %i",
-                    addr[0],
-                    msg.opcode,
-                )
-                if not self.__process_msg(msg, client_sock):
-                    break
-            except communication.ProtocolError as e:
-                logging.error("action: receive_message | result: fail | error: %s", e)
-            except EOFError:
-                break
-            except OSError as e:
-                logging.error("action: send_message | result: fail | error: %s", e)
-                break
-        client_sock.close()
-
-    def __accept_new_connection(self):
-        """
-        Accept new connections
-
-        Function blocks until a connection to a client is made.
-        Then connection created is printed and returned
-        """
-        # Connection arrived
-        logging.info("action: accept_connections | result: in_progress")
-        c, addr = self._server_socket.accept()
-        logging.info(f"action: accept_connections | result: success | ip: {addr[0]}")
-        return c
-
-    def __stop_running(self, _signum, _frame):
-        self._running = False
+    def __handle_sigterm(self, *_):
+        self._stop.set()
         self._server_socket.close()
