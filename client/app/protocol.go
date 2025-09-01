@@ -1,4 +1,4 @@
-package common
+package app
 
 import (
 	"bufio"
@@ -26,9 +26,10 @@ type Message interface {
 	GetOpCode() byte
 }
 
+// Writeable messages know how to write themselves to a net.Conn using the protocol framing:
+// opcode (1 byte) | length (int32, little-endian) | body (length bytes).
+// It returns the total body length written.
 type Writeable interface {
-	// writes contents to out following the package format (opcode, length, body)
-	// returns the total length of the body, or error if the write failed
 	WriteTo(out net.Conn) (int, error)
 }
 
@@ -47,7 +48,12 @@ func writePair(buff *bytes.Buffer, k string, v string) error {
 	return writeString(buff, v)
 }
 
+// writeMultiStringMap serializes a slice of map[string]string as a sequence of
+// [string map], adding the amount of pairs <k><v> at the beginning.
 func writeMultiStringMap(buff *bytes.Buffer, body []map[string]string) error {
+	if err := binary.Write(buff, binary.LittleEndian, int32(len(body))); err != nil {
+		return err
+	}
 	for _, m := range body {
 		if err := binary.Write(buff, binary.LittleEndian, int32(len(m))); err != nil {
 			return err
@@ -69,15 +75,15 @@ func (msg *NewBets) GetOpCode() byte {
 	return NewBetsOpCode
 }
 
+// WriteTo serializes NewBets using the protocol framing. The body is composed of
+// an int32 with the number of bets followed by that many [string map] entries.
+// Returns the body length written.
 func (msg *NewBets) WriteTo(out net.Conn) (int, error) {
 	var buff bytes.Buffer
 	if err := buff.WriteByte(NewBetsOpCode); err != nil {
 		return 0, err
 	}
 	var bodyBuff bytes.Buffer
-	if err := binary.Write(&bodyBuff, binary.LittleEndian, int32(len(msg.Bets))); err != nil {
-		return 0, err
-	}
 	if err := writeMultiStringMap(&bodyBuff, msg.Bets); err != nil {
 		return 0, err
 	}
@@ -95,8 +101,12 @@ func (msg *NewBets) WriteTo(out net.Conn) (int, error) {
 	return bodyBuff.Len(), nil
 }
 
+// Readable messages know how to read themselves from a reader based in the protocol framing:
+// opcode (1 byte) | length (int32, little-endian) | body (length bytes).
+// It's also possible to retrieve the message's opcode and body length.
+// Returns error if any operation fails.
 type Readable interface {
-	readFrom(reader *bufio.Reader) (Readable, error)
+	readFrom(reader *bufio.Reader) error
 	Message
 }
 
@@ -106,15 +116,15 @@ func (msg *BetsRecvSuccess) GetOpCode() byte {
 	return BetsRecvSuccessOpCode
 }
 
-func (msg *BetsRecvSuccess) readFrom(reader *bufio.Reader) (Readable, error) {
+func (msg *BetsRecvSuccess) readFrom(reader *bufio.Reader) error {
 	var length int32
 	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
-		return nil, err
+		return err
 	}
 	if length != 0 {
-		return nil, &ProtocolError{"invalid body length", BetsRecvSuccessOpCode}
+		return &ProtocolError{"invalid body length", BetsRecvSuccessOpCode}
 	}
-	return msg, nil
+	return nil
 }
 
 type BetsRecvFail struct{}
@@ -123,18 +133,19 @@ func (msg *BetsRecvFail) GetOpCode() byte {
 	return BetsRecvFailOpCode
 }
 
-func (msg *BetsRecvFail) readFrom(reader *bufio.Reader) (Readable, error) {
+func (msg *BetsRecvFail) readFrom(reader *bufio.Reader) error {
 	var length int32
 	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
-		return nil, err
+		return err
 	}
 	if length != 0 {
-		return nil, &ProtocolError{"invalid body length", BetsRecvFailOpCode}
+		return &ProtocolError{"invalid body length", BetsRecvFailOpCode}
 	}
-	return msg, nil
+	return nil
 }
 
-// reads contents from reader and returns the parsed package
+// ReadMessage reads an opcode from the stream and dispatches to the concrete message
+// reader accordingly. It returns the parsed message or a transport/protocol error.
 func ReadMessage(reader *bufio.Reader) (Readable, error) {
 	var opcode byte
 	var err error
@@ -143,15 +154,17 @@ func ReadMessage(reader *bufio.Reader) (Readable, error) {
 	}
 	switch opcode {
 	case BetsRecvSuccessOpCode:
-		{
-			var msg BetsRecvSuccess
-			return msg.readFrom(reader)
+		var msg BetsRecvSuccess
+		if err := msg.readFrom(reader); err != nil {
+			return nil, err
 		}
+		return &msg, nil
 	case BetsRecvFailOpCode:
-		{
-			var msg BetsRecvFail
-			return msg.readFrom(reader)
+		var msg BetsRecvFail
+		if err := msg.readFrom(reader); err != nil {
+			return nil, err
 		}
+		return &msg, nil
 	default:
 		return nil, &ProtocolError{"invalid opcode", opcode}
 	}

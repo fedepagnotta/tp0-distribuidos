@@ -1,4 +1,4 @@
-package common
+package app
 
 import (
 	"bufio"
@@ -34,9 +34,8 @@ func NewClient(config ClientConfig) *Client {
 	return client
 }
 
-// CreateClientSocket Initializes client socket. In case of
-// failure, error is printed in stdout/stderr and exit 1
-// is returned
+// createClientSocket establishes a TCP connection to ServerAddress.
+// On failure it logs the error and returns it without leaving a live connection behind.
 func (c *Client) createClientSocket() error {
 	conn, err := net.Dial("tcp", c.config.ServerAddress)
 	if err != nil {
@@ -51,7 +50,9 @@ func (c *Client) createClientSocket() error {
 	return nil
 }
 
-// SendBet Sends bet with the received parameters to the server, and waits for a response (success or fail)
+// SendBet opens a connection, serializes and sends a single bet (NewBets with 1 entry),
+// then waits for the server ack (BETS_RECV_SUCCESS or BETS_RECV_FAIL) and logs the result.
+// Supports graceful shutdown for SIGTERM.
 func (c *Client) SendBet(name string, lastName string, dni string, birthDate string, number string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
