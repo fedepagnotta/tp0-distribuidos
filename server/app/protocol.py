@@ -45,6 +45,7 @@ class NewBets:
             "NACIMIENTO",
             "NUMERO",
         )
+        self.amount: int = 0
 
     def __read_pair(self, sock: socket.socket, remaining: int) -> tuple[str, str, int]:
         (key, remaining) = read_string(sock, remaining, self.opcode)
@@ -73,23 +74,21 @@ class NewBets:
         )
         return remaining
 
-    def read_from(self, sock: socket.socket, length: int):
-        """
-        Parses the NEW_BETS body
-
-        First an int32 with the number of bets, then for each bet a
-        [string map] with exactly 6 key/value pairs
-        (AGENCIA, NOMBRE, APELLIDO, DOCUMENTO, NACIMIENTO, NUMERO).
-        Checks that the specified length is correct.
-        """
+    def read_from(self, sock, length: int):
         remaining = length
-        (n_bets, remaining) = read_i32(sock, remaining, self.opcode)
-        for _ in range(0, n_bets):
-            remaining = self.__read_bet(sock, remaining)
-        if remaining != 0:
-            raise ProtocolError(
-                "indicated length doesn't match body length", self.opcode
-            )
+        try:
+            n_bets, remaining = read_i32(sock, remaining, self.opcode)
+            self.amount = n_bets
+            for _ in range(n_bets):
+                remaining = self.__read_bet(sock, remaining)
+            if remaining != 0:
+                raise ProtocolError(
+                    "indicated length doesn't match body length", self.opcode
+                )
+        except ProtocolError:
+            if remaining > 0:
+                _ = recv_exactly(sock, remaining)
+            raise
 
 
 def recv_exactly(sock: socket.socket, n: int) -> bytes:
