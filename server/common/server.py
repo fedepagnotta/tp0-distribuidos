@@ -12,12 +12,12 @@ class Server:
         self._server_socket.bind(("", port))
         self._server_socket.listen(listen_backlog)
         self._stop = threading.Event()
-        self._finished = threading.Barrier(clients_amount)
+        self._finished = threading.Barrier(int(clients_amount))
         self._winners: dict[int, list[str]] = {}
-        self._raffle_done: bool = False
         self._raffle_lock = threading.Lock()
         self._storage_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
+        self._raffle_done = threading.Event()
 
     def run(self):
         signal.signal(signal.SIGTERM, self.__handle_sigterm)
@@ -98,16 +98,13 @@ class Server:
         if msg.opcode == communication.Opcodes.FINISHED:
             self._finished.wait()
             with self._raffle_lock:
-                if not self._raffle_done:
+                if not self._raffle_done.is_set():
                     self.__raffle()
             return True
         if msg.opcode == communication.Opcodes.REQUEST_WINNERS:
-            with self._raffle_lock:
-                ready = self._raffle_done
-            if ready:
-                self.__send_winners(msg.agency_id, client_sock)
-                return False
-            return True
+            self._raffle_done.wait()
+            self.__send_winners(msg.agency_id, client_sock)
+            return False
 
     def __raffle(self):
         try:
@@ -116,7 +113,7 @@ class Server:
             for w in winners:
                 self._winners.setdefault(w[0], []).append(w[1])
             logging.info("action: sorteo | result: success")
-            self._raffle_done = True
+            self._raffle_done.set()
         except Exception as e:
             logging.error("action: sorteo | result: fail | error: %s", e)
             return
