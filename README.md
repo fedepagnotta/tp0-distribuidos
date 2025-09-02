@@ -191,14 +191,6 @@ La corrección personal tendrá en cuenta la calidad del código entregado y cas
 
 ### Ejercicio N°1:
 
-#### Objetivo
-
-El script genera dinámicamente un archivo **Docker Compose** que define:
-
-- Un servicio **server**.
-- **N** servicios **client** numerados consecutivamente (**client1**, **client2**, …), donde **N** se pasa por parámetro.
-- Una **red** dedicada (`testing_net`) con un **subred** IPAM fijo.
-
 #### Interfaz y parámetros
 
 El script se invoca en la raíz del proyecto con:
@@ -331,6 +323,63 @@ networks:
         - subnet: 172.25.125.0/24
 ```
 
+#### Evitación de short-writes en client
+
+Se implementó la función `WriteFull`, que escribe un stream de bytes al socket utilizando un loop que chequea si todavía quedan bytes por escribir. Si efectivamente
+faltan, se vuelve a escribir utilizando la función `Write`, que devuelve la cantidad de bytes escritos, pero no devuelve error si hubo un short-write.
+
+```go
+func writeFull(conn net.Conn, b []byte) error {
+	for len(b) > 0 {
+		n, err := conn.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+```
+
+En `StartClientLoop` se utiliza esta función para escribir el mensaje.
+
+```go
+msg := fmt.Sprintf("[CLIENT %v] Message N°%v\n", c.config.ID, msgID)
+
+if err := writeFull(c.conn, []byte(msg)); err != nil {
+    log.Errorf("action: send | result: fail | client_id: %v | error: %v", c.config.ID, err)
+    return
+}
+```
+
+#### Evitación de short-reads y short-writes en server
+
+El manejo de la conexión con el cliente en `__handle_client_connection` fue modificado, tal que la lectura y escritura ahora se ven así:
+
+```python
+try:
+    rf = client_sock.makefile("rb")
+    line = rf.readline(64 * 1024)
+    if line == b"":
+        raise EOFError("peer closed connection")
+    msg = line.rstrip(b"\r\n").decode("utf-8")
+    addr = client_sock.getpeername()
+    logging.info(
+        "action: receive_message | result: success | ip: %s | msg: %s",
+        addr[0],
+        msg,
+    )
+    client_sock.sendall((msg + "\n").encode("utf-8"))
+except (UnicodeDecodeError, EOFError, OSError) as e:
+    logging.error("action: receive_message | result: fail | error: %s", e)
+finally:
+    client_sock.close()
+```
+
+Se puede observar que se utiliza la función `makefile` para crear un stream de bytes para solo lectura conectado al socket, a partir del cual se leen hasta
+64kB del socket con la función `readline`, que internamente hace los recv necesarios para evitar short-reads.
+Por otro lado, para la escritura se utiliza `sendall`, que evita short-writes internamente, ya que garantiza enviar todo el buffer o fallar.
+
 ### Ejercicio N°2:
 
 #### Cambios en el Dockerfile del cliente
@@ -436,412 +485,16 @@ requieren puertos publicados hacia el host ni instalación de herramientas fuera
 Se utiliza **Alpine** por ser una base **ligera**, con un conjunto de herramientas **acotado** y suficiente para el objetivo del ejercicio.
 Permite instalar `netcat-openbsd` de forma simple y mantener la imagen mínima necesaria para ejecutar la validación.
 
-### Ejercicio N°4:
+### Ejercicio N°4
 
 #### Server
 
-Se utilizó un nuevo parámetro `_running` en la clase `Server`, que se inicializa en `False`, y en el método `Server.run()` se setea a `True`. La condición del `while`
-pasa a chequear ese parámetro, de tal forma que, al convertirse en `False`, se dejan de aceptar nuevas conexiones.
+**Resumen.** El servidor atiende conexiones secuencialmente. Al recibir `SIGTERM`, deja de aceptar nuevas conexiones cerrando el **socket de escucha** y
+sale del loop principal. Cada conexión se procesa de punta a punta (leer 1 línea, loguear, hacer echo, cerrar).
 
-Para cambiar el valor de `_running` se creó un handler para la señal `SIGTERM`. En este handler, llamado `__stop_running`, se setea `_running` a `False`, y se cierra
-el `socket` del server (`Server._server_socket`). Al cerrar el `socket` se evita que el el proceso quede bloqueado esperando una nueva conexión de un cliente, ya que se
-podría dar que se chequea la condición del `while`, se cumple esa condición, se pasa a esperar una nueva conexión, y recién ahí llega un `SIGTERM`. Cerrando el socket
-hacemos que falle el `accept()` con `OSError`, y ahí se chequea si `self._running == False`, y en ese caso se rompe el loop en vez de propagar el error.
+##### Puntos clave
 
-Cuando se sale del loop principal de `run`, se llama a `logging.shutdown()` para flushear buffers y liberar recursos utilizados para logging.
-
-En resumen: al recibir `SIGTERM`, se drena la última conexión establecida con un cliente y se dejan de aceptar conexiones nuevas.
-
-Versión final de `run()`:
-
-```python
-    def run(self):
-        """
-        Dummy Server loop
-
-        Server that accept a new connections and establishes a
-        communication with a client. After client with communucation
-        finishes, servers starts to accept new connections again
-        """
-
-        self._running = True
-        signal.signal(signal.SIGTERM, self.__stop_running)
-        while self._running:
-            try:
-                client_sock = self.__accept_new_connection()
-                self.__handle_client_connection(client_sock)
-            except OSError:
-                if not self._running:
-                    break
-                raise
-        logging.shutdown()
-```
-
-Versión final de `__stop_running()`:
-
-```python
-    def __stop_running(self, signum, frame):
-        self._running = False
-        self._server_socket.close()
-```
-
-#### Client
-
-Se utilizó un `context` creado con `signal.NotifyContext`, para "bypassear" el comportamiento por defecto de Go a la hora de recibir señales `SIGTERM`. En otras palabras,
-`signal.NotifyContext` convierte `SIGTERM` en cancelación de contexto, lo que permite handlear la interrupción, limpiando lo necesario y terminando de forma ordenada.
-
-Este contexto se creó en la función `StartClientLoop`. Seguido de esto, se utilizó `defer stop()` para posponer la interrupción del programa hasta que la función
-retorne. De esta forma, se puede handlear la señal, hacer un `graceful shutdown`, y finalmente terminar la ejecución.
-
-El loop de `StartClientLoop` fue modificado, quedando así:
-
-```go
-for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
-    select {
-    case <-ctx.Done():
-        return
-    default:
-    }
-    // Create the connection the server in every loop iteration. Send an
-    c.createClientSocket()
-
-    // TODO: Modify the send to avoid short-write
-    fmt.Fprintf(
-        c.conn,
-        "[CLIENT %v] Message N°%v\n",
-        c.config.ID,
-        msgID,
-    )
-
-    readDone := make(chan struct{})
-    var msg string
-    var err error
-    go func() {
-        msg, err = bufio.NewReader(c.conn).ReadString('\n')
-        close(readDone)
-    }()
-
-    timer := time.NewTimer(c.config.LoopPeriod)
-    select {
-    case <-ctx.Done():
-        _ = c.conn.SetReadDeadline(time.Now())
-        <-readDone
-        timer.Stop()
-        c.conn.Close()
-        return
-    case <-timer.C:
-        select {
-        case <-ctx.Done():
-            _ = c.conn.SetReadDeadline(time.Now())
-            <-readDone
-            timer.Stop()
-            c.conn.Close()
-            return
-        case <-readDone:
-            c.conn.Close()
-            if err != nil {
-                log.Errorf("action: receive_message | result: fail | client_id: %v | error: %v",
-                    c.config.ID,
-                    err,
-                )
-                return
-            }
-            log.Infof("action: receive_message | result: success | client_id: %v | msg: %v",
-                c.config.ID,
-                msg,
-            )
-        }
-    }
-}
-```
-
-Veámoslo en detalle:
-
-1. Al principio de cada iteración se agregó un chequeo, para ver si la señal ya había sido notificada en el contexto.
-2. La lectura del buffer se pasó a una `goroutine`, que cierra un canal `readDone` al finalizar la lectura.
-3. En vez de hacer un `sleep` para separar los envíos del cliente, se utilizó un `timer`, y luego, utilizando un `select`, la main routine quedó bloqueada
-   esperando la señal del contexto (el `SIGTERM`), o la señal del timer (la finalización del `LoopPeriod` seteado en el archivo de configuración).
-
-- Si lo primero en suceder es que llega el `SIGTERM`, se setea un deadline para la operación de lectura que estaba realizando la goroutine, haciendo que se interrumpa
-  la misma. Luego, se espera a que se cierre el canal `readDone` para frenar el `timer`, cerrar el `socket` del cliente, y retornar para ejecutar el `stop()` del `defer`.
-- Si lo primero en suceder es que se termina el timer, se vuelve a hacer un `select`, esta vez esperando al `SIGTERM` o a que se finalice la lectura de la `goroutine`.
-  Si llega el `SIGTERM` primero, se ejecuta el flujo mencionado justo arriba. En caso contrario, simplemente se cierra el socket de la iteración actual, y se loggea el
-  resultado correspondiente.
-
-De esta forma, tanto la lectura como la espera entre envíos al servidor son interrumpibles de forma ordenada, y se puede realizar un `graceful shutdown` al recibir un
-`SIGTERM`.
-
-### Ejercicio N°5:
-
-#### Protocolo
-
-El protocolo de comunicación utilizado se basa en envío de paquetes con ordenamiento little endian y el siguiente formato:
-
-| opcode | length | body |
-0........1........5......5 + length
-
-Para describir el formato del cuerpo de los paquetes, utilizaremos la siguiente notación (basada en el protocolo nativo de Cassandra):
-
-- [int]: Un entero de 4 bytes.
-- [string]: Un n de tipo [int], seguido de n bytes representando un string UTF-8.
-- [string map]: Un n de tipo [int], seguido de n pares <k><v> donde <k> y <v> son [string].
-- [multi string map]: Un n de tipo [int], seguido de n [string map].
-
-Como se puede observar, el campo `opcode` es el primer byte del paquete, y puede tomar los siguientes valores:
-
-- 0: _NEW_BETS_. Es enviado por el cliente, y representa un conjunto de apuestas. Es el único mensaje que tiene un body, y éste es un [multi string map]. En este ejercicio
-  este [multi string map] va a tener tamaño fijo 1, pero se utiliza este formato para favorecer escalabilidad a futuro y facilitar la implementación de envío
-  de bets por batches. Dado que la única diferencia entre un [string map] y un [multi string map] de tamaño 1 son 4 bytes, se considera que el trade off es
-  positivo, y vale la pena simplificar implementaciones futuras en desmero de la ligereza de los paquetes, ya que la diferencia de tamaño en bytes es muy pequeña.
-
-- 1: _BETS_RECV_SUCCESS_. Es enviado por el server en respuesta al cliente si pudo procesar con éxito todas las apuestas.
-
-- 2: _BETS_RECV_FAIL_. Es enviado por el server en respuesta al cliente si hubo un error al procesar alguna de las apuestas.
-
-Por último, el campo `length` indica la longitud total en bytes del body.
-
-#### Client-side
-
-**Resumen de la implementación**
-
-El cliente está dividido en dos módulos:
-
-- `client/common/communication.go`: define el **protocolo**, los **mensajes**, y la **serialización**/**deserialización** (capa de transporte).
-- `client/common/client.go`: maneja la **conexión**, el **ciclo de envío/recepción**, el **manejo de señales** y el **logging** (capa de aplicación).
-
-Esta separación cumple con la consigna de “correcta separación de responsabilidades”: el modelo de dominio de los mensajes y su codificación vive en `communication.go`,
-mientras que la lógica de negocio del cliente (abrir socket, enviar apuesta, esperar confirmación y loguear) vive en `client.go`.
-
----
-
-**Aspectos clave de la implementación**
-
-1. **Definición de un protocolo para el envío de los mensajes**
-   - El formato físico del paquete es `opcode (1 byte) | length (int32 LE) | body`, con ordenamiento **little endian**, tal como se documenta en la sección de Protocolo.
-   - Se modelan tipos de mensaje concretos: `NewBets` (cliente→servidor), `BetsRecvSuccess` y `BetsRecvFail` (servidor→cliente).
-     Los mensajes implementan interfaces (`Message`, `Writeable`, `Readable`) para dejar explícita la responsabilidad de cada uno (obtener opcode, escribirse/leerse).
-
-2. **Serialización de los datos**
-   - La función `writeString` serializa strings como `[int32 longitud][bytes UTF-8]`.
-   - `writePair` y `writeMultiStringMap` construyen el **\[string map]** y el **\[multi string map]** (con su contador `int32` previo),
-     exactamente como se definió en el protocolo.
-   - `NewBets.WriteTo` arma el body en un `bytes.Buffer`, antepone el `length` y luego compone el paquete completo. Esto garantiza que el paquete enviado
-     respeta la estructura pactada.
-   - En la lectura, `ReadMessage` consume primero el `opcode` y, según su valor, delega en el `readFrom` específico del mensaje.
-     En las respuestas del servidor (`BetsRecvSuccess`/`BetsRecvFail`) se valida que `length == 0`, lo que agrega **sanidad de protocolo** (si llega basura, se rechaza).
-
-3. **Correcta separación de responsabilidades**
-   - **Transporte** (`communication.go`): sabe serializar/deserializar y validar mínimos de protocolo (opcodes válidos, longitudes esperadas).
-     Define `ProtocolError` con contexto (incluye `Opcode`) para facilitar diagnóstico.
-   - **Aplicación** (`client.go`): abre el socket (`createClientSocket`), compone el mensaje `NewBets` con los datos de la apuesta y maneja tiempos de vida/cierre,
-     errores y logging.
-
-4. **Empleo correcto de sockets, manejo de errores y evitación de _short read_ / _short write_**
-   - **Evita _short write_**:
-     - `NewBets.WriteTo` construye el paquete completo en memoria y usa `io.Copy(out, &buff)`.
-     - `io.Copy`/`bytes.Buffer.WriteTo` **reintenta internamente** hasta transferir todos los bytes o fallar, cubriendo _partial writes_
-       del `net.Conn` sin que el llamador tenga que implementar el bucle manual.
-     - Al devolver la longitud escrita y propagar errores, se permite loguear/actuar ante fallas.
-
-   - **Evita _short read_**:
-     - La lectura usa un `bufio.Reader` y **operaciones de tamaño fijo**: `ReadByte` (para `opcode`) y `binary.Read` (para `int32 length`),
-       que leen **exactamente** el número de bytes requerido o devuelven error.
-     - Al validar que `length == 0` en las respuestas, se evita intentar leer un body ausente y se detectan desalineaciones
-       (previniendo lecturas incompletas o corridas).
-
-   - **No bloqueo indefinido y cierre ordenado**:
-     - `SendBet` atacha un contexto a `SIGTERM` con `signal.NotifyContext`. La lectura del mensaje de respuesta se hace en una goroutine y se
-       coordina con un canal `readDone`.
-     - Si llega una señal, se fuerza un `SetReadDeadline(time.Now())` para **desbloquear** la goroutine de lectura y poder cerrar el `conn`
-       limpiamente (**graceful shutdown**).
-     - En ambos caminos (respuesta o cancelación), el socket se cierra de forma explícita.
-
-5. **Variables de entorno y contenido de la apuesta**
-   - La implementación de `SendBet(name, lastName, dni, birthDate, number)` **recibe** exactamente los campos `NOMBRE`, `APELLIDO`, `DOCUMENTO`, `NACIMIENTO` y
-     `NUMERO` y arma un `NewBets` con un único **\[string map]** que incluye:
-     - `AGENCIA`: `c.config.ID` (identifica a la agencia; satisface el requisito de 5 agencias distintas configurando IDs distintos).
-     - `NOMBRE`, `APELLIDO`, `DOCUMENTO`, `NACIMIENTO`, `NUMERO`: con los valores suministrados (leídos del entorno en el `main`).
-
-   - Se modificó el script `generar-compose.sh` para inyectar dichos valores en el `docker-compose` vía `environment:` y el
-     proceso que invoca `SendBet` los pasa como parámetros. De este modo, se cumple la interfaz pedida por el enunciado sin acoplar
-     la capa de transporte a `os.Getenv`.
-
-6. **Confirmación y logging conforme al enunciado**
-   - Tras enviar `NewBets`, el cliente **espera una única respuesta**: `BETS_RECV_SUCCESS` u `BETS_RECV_FAIL`.
-   - Si llega `BETS_RECV_SUCCESS`, se loguea exactamente:
-
-     ```
-     action: apuesta_enviada | result: success | dni: ${DNI} | numero: ${NUMERO}
-     ```
-
-   - Si hay error de I/O, `opcode` inválido, `length` no esperado, o respuesta `BETS_RECV_FAIL`, se loguea el caso `fail` con los
-     mismos campos de contexto (`dni`, `numero`).
-
----
-
-**Detalles de diseño relevantes**
-
-- **Ordenamiento de claves en los mapas**: en Go, iterar un `map[string]string` no garantiza orden; esto **no afecta** la interoperabilidad porque
-  el protocolo serializa **pares `<k><v>` auto-descriptivos** con un contador previo. El servidor reconstruye el diccionario sin asumir orden.
-- **Tamaños y tipos**: se usan `int32` para longitudes/contadores, suficientes para los volúmenes del TP y homogéneos con la notación del protocolo.
-
-#### Server-side
-
-**Resumen de la implementación**
-
-El servidor se organiza en módulos con responsabilidades bien delimitadas:
-
-- `server/common/communication.py`: capa de **protocolo/transporte**. Define opcodes, formato binario (little endian), rutinas de serialización/deserialización,
-  validaciones estructurales y los mensajes `BETS_RECV_SUCCESS`/`BETS_RECV_FAIL`. Implementa la lectura robusta del stream y el procesamiento de `NEW_BETS`.
-- `server/common/server.py`: capa de **aplicación**. Acepta conexiones, coordina el ciclo petición/respuesta, maneja señales (graceful shutdown),
-  centraliza logging y cierre de recursos.
-- `server/common/utils.py`: **persistencia** y modelo de dominio (`Bet`, `store_bets`, `has_won`, etc.).
-- `server/main.py`: **bootstrap** (parsing de configuración desde variables de entorno/archivo, inicialización de logging y arranque del loop del servidor).
-
----
-
-**Aspectos clave de la implementación**
-
-1. **Definición del protocolo para el envío de los mensajes**
-   - Los opcodes reflejan exactamente la especificación: `NEW_BETS=0`, `BETS_RECV_SUCCESS=1`, `BETS_RECV_FAIL=2` (clase `Opcodes`).
-   - El framing del paquete es `opcode (u8) | length (i32 LE) | body`, con endianness **little endian** (todos los `read_*`/`write_*` utilizan formatos `"<B"`, `"<i"`).
-   - Para `NEW_BETS`, el body es un **\[multi string map]**: primero un `int32` con el número de apuestas, y luego por cada apuesta un
-     **\[string map]** de exactamente 6 pares `<k><v>` (`AGENCIA`, `NOMBRE`, `APELLIDO`, `DOCUMENTO`, `NACIMIENTO`, `NUMERO`). La clase `NewBets`
-     valida ambos aspectos (cantidad de pares y presencia de claves requeridas).
-
-2. **Serialización/Deserialización de datos**
-   - **Deserialización (entrada):**
-     - `recv_msg` lee `opcode` (`read_u8`) y `length` (`read_i32` con verificación de remanente). Si `opcode==NEW_BETS`, construye `NewBets` y delega
-       en `read_from(sock, length)`.
-     - `read_from` en `NewBets` consume el contador de apuestas y, por cada una, usa `__read_bet` → `__read_pair` → `read_string` para reconstruir los pares `<k><v>`.
-     - `read_string` valida longitud positiva, disponible en el `remaining` y decodifica UTF-8 con manejo de `UnicodeDecodeError` (conversión a `ProtocolError`).
-     - Se mantiene un contador `remaining` consistente a lo largo de la lectura y se exige **`remaining == 0`** al final: cualquier desalineación dispara `ProtocolError`.
-
-   - **Serialización (salida):**
-     - Las respuestas usan `write_u8` + `write_i32(0)`. El método `write_struct` empaqueta con `struct.pack` y envía con `sock.sendall`, que garantiza la
-       escritura de **todos los bytes** o un error, conforme al framing.
-
-3. **Correcta separación de responsabilidades (dominio vs comunicación)**
-   - La capa de **comunicación** valida el _wire format_, tipos, longitudes y opcodes; expone `NewBets.process()` pero sin mezclarla con E/S de sockets más allá
-     del mensaje.
-   - El **dominio** (`utils.Bet`, `store_bets`) se limita a representación y persistencia (CSV), sin conocer el protocolo binario.
-   - La **aplicación** (`Server`) orquesta conexiones, maneja errores y decide qué respuesta enviar.
-
-4. **Empleo correcto de sockets, manejo de errores y evitación de _short read_ / _short write_**
-   - **Prevención de _short read_**:
-     - `recv_exactly(sock, n)` implementa un bucle de lectura que acumula hasta leer **exactamente n bytes**, reintentando ante `InterruptedError`, propagando
-       `timeout`/`OSError` como `ProtocolError`, y considerando `nrecv==0` como EOF (lanza `EOFError`).
-     - Todas las lecturas de tipos de tamaño fijo (`read_struct`) pasan por `recv_exactly`, eliminando lecturas parciales.
-     - El uso del contador `remaining` en `read_i32`/`read_string` fuerza la consistencia entre el `length` informado y el cuerpo efectivamente consumido.
-
-   - **Prevención de _short write_**:
-     - Las respuestas (`BETS_RECV_SUCCESS`/`BETS_RECV_FAIL`) se envían con `sock.sendall`, que bloquea hasta enviar el buffer completo o fallar, evitando _partial writes_.
-
-   - **Manejo de errores y robustez**:
-     - En `Server.__handle_client_connection`, se capturan `EOFError` y `ProtocolError`. En ambos casos se loguea el fallo, se intenta emitir `BETS_RECV_FAIL`
-       (y si esa emisión falla, se loguea también) y **siempre** se cierra el socket en `finally`.
-     - En éxito, se responde `BETS_RECV_SUCCESS` y luego se invoca `msg.process()`; véase el siguiente punto.
-
-5. **Procesamiento de negocio y logging conforme a la consigna**
-   - `NewBets.process()` delega en `utils.store_bets(self.bets)` la persistencia y, para **cada apuesta**, emite el log requerido por el enunciado:
-
-     ```
-     action: apuesta_almacenada | result: success | dni: %s | numero: %s
-     ```
-
-   - `Server.__handle_client_connection` registra la recepción del mensaje (`receive_message | success`) e implementa la semántica de _ack temprano_: responde
-     `BETS_RECV_SUCCESS` al cliente (confirmación de recepción y parseo exitosos) y **luego** procesa y persiste. Esta elección desacopla la latencia del cliente
-     de la E/S en disco. Si se quisiera confirmar _persistencia_ y no solo _recepción_, el protocolo podría evolucionar para que el ack llegue **después** del
-     `process()` o para transportar un código de error; tal cambio no es requerido por la consigna actual.
-   - En caso de errores de protocolo o EOF, se responde `BETS_RECV_FAIL` como indica la especificación.
-
----
-
-**Detalles de diseño relevantes**
-
-- **Validación estricta del body:** `NewBets.__read_bet` exige exactamente **6 pares** y la presencia de **todas** las claves requeridas; ante cualquier desvío,
-  se lanza `ProtocolError("invalid body")`. Esto evita estados intermedios inconsistentes y previene escritura de registros corruptos.
-- **Endianness y tamaños homogéneos:** todos los enteros del protocolo son `int32` LE; las strings usan prefijo de longitud `int32` y se validan
-  (longitud positiva y bytes suficientes).
-- **Manejo de Unicode:** los cuerpos de strings se decodifican en UTF-8; errores de decodificación se traducen a `ProtocolError("invalid body")`, manteniendo unívoca
-  la semántica de error de protocolo.
-
-### Ejercicio N°6:
-
-#### Cliente
-
-La solución implementa **envío por lotes (batching)**, respetando el framing del protocolo y el límite de 8 KiB. Para cada apuesta, el cliente serializa un `string map` y lo acumula en un `bytes.Buffer`. Antes de agregar una apuesta, se verifica si el paquete resultante superaría `8*1024` bytes (incluyendo `opcode(1) + length(4) + n(4)`) o el `batchLimit`. Si no entra, se **emite el batch actual** y se inicia uno nuevo con la apuesta en curso. Al finalizar el archivo o ante cancelación, se realiza **flush** del batch pendiente.
-
-El envío de un paquete sigue exactamente el formato del protocolo: `opcode | length | n | body`, donde `length` es el tamaño en bytes del **body** y `n` la cantidad de apuestas. Se utiliza `io.Copy` para volcar el cuerpo al socket, lo que garantiza que **no haya short writes**, ya que `io.Copy` reintenta internamente hasta completar la escritura de todos los bytes (salvo error). De manera análoga, el encabezado (`opcode`, `length`, `n`) se emite con escrituras fijas de 1 y 4 bytes en little-endian.
-
-Ejemplo representativo del envío del batch:
-
-```go
-if err := binary.Write(finalOutput, binary.LittleEndian, NewBetsOpCode); err != nil { return err }
-if err := binary.Write(finalOutput, binary.LittleEndian, int32(4+to.Len())); err != nil { return err }
-if err := binary.Write(finalOutput, binary.LittleEndian, *betsCounter); err != nil { return err }
-if _, err := io.Copy(finalOutput, to); err != nil { return err }
-```
-
-Para la **recepción de la respuesta** del servidor, se corre una goroutine que realiza la lectura con un `bufio.Reader` y se sincroniza mediante un canal (`readDone`). El `bufio.Reader` y la decodificación por framing ocultan **short reads** de la capa TCP: si el SO entrega menos bytes en una llamada, la lectura continúa hasta completar el mensaje.
-
-El **graceful shutdown** del cliente se instrumenta con `signal.NotifyContext` sobre `SIGTERM`. Cuando llega la señal durante el envío o la espera de respuesta:
-
-- En el camino de **escritura**, el proceso de “build & flush” chequea `ctx.Done()` en cada iteración y, si el contexto se cancela, **flushea el batch parcial** y retorna.
-- En el camino de **lectura**, al activarse el `select` por `ctx.Done()` se **cierra la mitad de escritura** para señalar EOF al servidor y se establece un **deadline de lectura** breve para desbloquear la goroutine lectora; luego se espera a `readDone` y se termina ordenadamente.
-
-Fragmento relevante del manejo de señal en la espera de respuesta:
-
-```go
-case <-ctx.Done():
-    if tcp, ok := c.conn.(*net.TCPConn); ok {
-        _ = tcp.CloseWrite()
-    }
-    _ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-    <-readDone
-    return
-```
-
-Con este flujo, el cliente garantiza: (a) batching con límite de tamaño y cantidad, (b) emisión exacta conforme al framing, (c) **ausencia de short writes** (`io.Copy`) y **short reads** percibidos por la lógica de aplicación (`bufio.Reader`), y (d) **terminación ordenada** ante `SIGTERM`, drenando lo pendiente y sin dejar operaciones bloqueadas.
-
----
-
-#### Servidor
-
-El servidor acepta conexiones y, para cada socket de cliente, procesa **múltiples mensajes** en un loop. La deserialización cumple el framing del protocolo:
-
-1. Se lee `opcode` (`u8`) y `length` (`i32 LE`).
-2. Para `NEW_BETS`, se lee `n` (`i32 LE`) y luego `n` apuestas, cada una como `n_pairs` (`i32 LE`) seguido de `n_pairs` pares `<string, string>` en UTF-8, con longitudes prefijadas en little-endian.
-3. Ante **cualquier inconsistencia** del body (por ejemplo `n_pairs != 6`, claves faltantes, tamaños inválidos o errores de decodificación), se **descarta el batch completo**, tal como exige la modalidad “all-or-nothing”.
-
-Para **evitar short reads**, la lectura del body se hace con una primitiva de exactitud:
-
-```python
-def recv_exactly(sock: socket.socket, n: int) -> bytes:
-    data = bytearray(n)
-    view = memoryview(data)
-    read = 0
-    while read < n:
-        nrecv = sock.recv_into(view[read:], n - read)
-        if nrecv == 0:
-            raise EOFError("peer closed connection")
-        read += nrecv
-    return bytes(data)
-```
-
-Esta función itera hasta completar exactamente `n` bytes o aborta; de ese modo, un retorno parcial de `recv` no se propaga a la lógica de decodificación. Cuando durante la lectura del body ocurre un error de framing o contenido, el servidor **drena los bytes restantes** del body antes de re-lanzar, dejando el stream **resíncronizado** para el siguiente mensaje o cierre de conexión.
-
-Las respuestas siguen el contrato “todo o nada”: si el batch se decodifica y procesa sin errores, se envía `BETS_RECV_SUCCESS`; si se detecta cualquier problema en la decodificación o durante la validación de las apuestas, se responde `BETS_RECV_FAIL`. El envío de respuestas utiliza `sendall`, que garantiza que **no haya short writes** a nivel de aplicación:
-
-```python
-def write_struct(sock: socket.socket, fmt: str, *values) -> None:
-    data = struct.pack(fmt, *values)
-    sock.sendall(data)
-```
-
-El **graceful shutdown** del servidor se implementa con un flag `_running` y un handler de `SIGTERM`. Al recibir la señal, el handler marca `_running = False` y **cierra el socket de escucha**. El cierre del listener provoca que `accept()` falle con `OSError`; el loop principal detecta que `_running` ya es `False` y sale sin aceptar nuevas conexiones, **drenando** antes la conexión en curso. Finalmente, se ejecuta `logging.shutdown()` para asegurar el vaciado de buffers de log.
-
-Versión final del ciclo principal, coherente con el esquema de drenado:
+- **Loop principal con corte por señal**
 
 ```python
 def run(self):
@@ -858,7 +511,174 @@ def run(self):
     logging.shutdown()
 ```
 
-En conjunto, el servidor garantiza: (a) deserialización exacta y validación integral del **batch completo**, (b) **descartado total** ante la primera apuesta inválida, (c) **ausencia de short reads/writes** visibles para la lógica gracias a `recv_exactly` y `sendall`, y (d) **terminación ordenada** ante `SIGTERM`, sin aceptar nuevas conexiones y permitiendo que la última conexión activa finalice su procesamiento.
+- **Handler de SIGTERM**: marca el stop y **cierra el listener** para “desbloquear” `accept()` con un `OSError` controlado:
+
+```python
+def __stop_running(self, signum, frame):
+    self._running = False
+    self._server_socket.close()
+```
+
+**Qué garantiza el servidor**
+
+- **No quedan bloqueos**: cerrar el listener hace que `accept()` despierte y el loop finalice.
+- **Lecturas/escrituras completas**: `readline()` y `sendall()` manejan internamente **short read/write**.
+- **Cierre ordenado**: cada socket del cliente se cierra en `finally`; al final, `logging.shutdown()` drena los buffers de log.
+
+#### Cliente
+
+**Resumen.** El cliente envía `LoopAmount` mensajes, uno cada `LoopPeriod`. Usa `signal.NotifyContext` para convertir `SIGTERM` en
+**cancelación de contexto**, lo que le permite interrumpir de forma limpia: fija `ReadDeadline`, espera a terminar una lectura pendiente
+y cierra la conexión actual.
+
+##### Puntos clave
+
+- **Contexto cancelable por SIGTERM**
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+defer stop()
+```
+
+- **Conexión por iteración + cierre garantizado**
+
+```go
+conn, derr := net.Dial("tcp", c.config.ServerAddress)
+if derr != nil { /* log y return */ }
+c.conn = conn
+defer conn.Close() // cierra esta conexión pase lo que pase en la iteración
+```
+
+- **Lectura en goroutine + sincronización + timer**
+
+```go
+readDone := make(chan struct{})
+var msg string
+var err error
+go func() {
+    msg, err = bufio.NewReader(c.conn).ReadString('\n')
+    close(readDone)
+}()
+
+timer := time.NewTimer(c.config.LoopPeriod)
+select {
+case <-ctx.Done():
+    _ = c.conn.SetReadDeadline(time.Now()) // desbloquea ReadString
+    <-readDone
+    timer.Stop()
+    c.conn.Close()
+    return
+case <-timer.C:
+    select {
+    case <-ctx.Done():
+        _ = c.conn.SetReadDeadline(time.Now())
+        <-readDone
+        timer.Stop()
+        c.conn.Close()
+        return
+    case <-readDone:
+        c.conn.Close()
+        if err != nil { /* log fail y return */ }
+        log.Infof("action: receive_message | result: success | client_id: %v | msg: %v", c.config.ID, msg)
+    }
+}
+```
+
+**Qué garantiza el cliente**
+
+- **Terminación limpia ante `SIGTERM`**: si el cliente está esperando respuesta, se fuerza un deadline de lectura para **desbloquear**
+  la goroutine lectora, se espera a que termine y se cierran los recursos.
+- **Sin short-write**: el `bufio.Writer` + `Flush()` aseguran que el mensaje se envíe completo antes de continuar.
+- **Cierre explícito por iteración**: cada conexión se cierra antes de pasar al siguiente envío. El `defer conn.Close()` local
+  asegura el cierre incluso ante retornos tempranos.
+
+#### Resultado
+
+Con este diseño, ambos procesos cumplen con **graceful shutdown**:
+
+- El servidor **deja de aceptar nuevas conexiones** y **drena** la conexión en curso.
+- El cliente **interrumpe lecturas bloqueadas**, **cierra la conexión** de la iteración y **termina ordenadamente**.
+- Se evitan **short reads/writes** y se **registran** los eventos relevantes de cierre y de I/O.
+
+### Ejercicio N°5:
+
+#### Protocolo
+
+El protocolo binario utiliza ordenamiento **little endian** y framing fijo:
+
+```
+| opcode: u8 | length: int32 | body (length bytes) |
+```
+
+Para describir el body se usa la notación:
+
+- **\[int]**: entero de 4 bytes (int32 LE).
+- **\[string]**: un \[int] `n` seguido de `n` bytes UTF-8.
+- **\[string map]**: un \[int] `m` seguido de `m` pares `<k><v>` donde cada `<k>` y `<v>` es un \[string].
+- **\[multi string map]**: un \[int] `n` seguido de `n` \[string map].
+
+Mensajes implementados:
+
+- **NEW_BETS (0)** — cliente → servidor. Body: un **\[multi string map]** que, en este ejercicio, contiene **1** \[string map] con las
+  claves obligatorias: `AGENCIA`, `NOMBRE`, `APELLIDO`, `DOCUMENTO`, `NACIMIENTO`, `NUMERO`. Se elige este formato (en vez de un único map)
+  para mantener compatibilidad futura con batches.
+- **BETS_RECV_SUCCESS (1)** — servidor → cliente. Body: vacío.
+- **BETS_RECV_FAIL (2)** — servidor → cliente. Body: vacío.
+
+`length` indica la longitud exacta del body.
+
+#### Client
+
+El cliente está dividido en dos archivos dentro del paquete `app`:
+
+- `protocol.go`: define el **formato de los mensajes** y su **serialización/deserialización** (transporte).
+- `client.go`: maneja **conexiones**, **envío**, **espera de respuesta**, **graceful shutdown** y **logging** (aplicación).
+
+**Flujo principal**
+
+1. Se abre una conexión TCP al servidor.
+2. Se construye un `NewBets` con un único **\[string map]** usando los campos provistos (incluyendo `AGENCIA` = `ClientConfig.ID`).
+3. Se escribe el paquete completo respetando el framing; la escritura se hace con `io.Copy`/`bytes.Buffer.WriteTo`, que internamente reintenta hasta enviar
+   todo el buffer, evitando **short writes**.
+4. En paralelo, se queda a la espera de una única respuesta (`BETS_RECV_SUCCESS`/`BETS_RECV_FAIL`). La lectura usa `bufio.Reader` y `binary.Read` de
+   tamaños fijos para evitar **short reads**.
+5. Si llega `SIGTERM`, se convierte en cancelación de contexto; se fija un `ReadDeadline(time.Now())` para **desbloquear** la goroutine de lectura y
+   cerrar la conexión de forma ordenada.
+6. Según la respuesta, se imprime exactamente:
+   - `action: apuesta_enviada | result: success | dni: ${DNI} | numero: ${NUMERO}`, o
+   - el mismo log con `result: fail` ante error de protocolo/IO o respuesta de fallo.
+
+**Detalle de transporte**
+
+- `NewBets.WriteTo` arma en memoria `opcode | length | body` y lo vuelca a la conexión, minimizando syscalls y asegurando atomicidad lógica del paquete.
+- `ReadMessage` consume `opcode` y delega en el lector específico del mensaje; las respuestas de éxito/fallo exigen `length == 0` para detectar corrimientos o basura.
+
+#### Server
+
+El servidor se organiza en tres módulos:
+
+- `app/protocol.py`: **transporte** (opcodes, framing, lectura robusta). Implementa `recv_exactly` para leer **exactamente N bytes**, evitando **short reads**,
+  y usa `sendall` en las escrituras, evitando **short writes**.
+- `app/service.py`: **adaptación de dominio**. Convierte `RawBet` (transporte) a `utils.Bet` y delega en `utils.store_bets`.
+- `app/net.py`: **aplicación**. Acepta conexiones, procesa un único `NEW_BETS` por conexión, responde con `BETS_RECV_SUCCESS`/`BETS_RECV_FAIL` y cierra el socket.
+  Implementa **graceful shutdown** con `SIGTERM`: cierra el socket de escucha para despertar `accept()` y drenar el loop.
+
+**Camino feliz (resumen)**
+
+- `Server.run()` acepta una conexión.
+- `recv_msg()` parsea `NEW_BETS` validando estructura y longitudes.
+- Se responde **SUCCESS** y luego se persiste con `service.store_bets(...)`.
+- Por cada apuesta persistida se emite (según implementación del servicio) el log:
+
+  ```
+  action: apuesta_almacenada | result: success | dni: ${DNI} | numero: ${NUMERO}
+  ```
+
+**Robustez de E/S**
+
+- **Lectura**: `recv_exactly` reintenta hasta completar; `read_i32`/`read_u8`/`read_string` controlan tamaños y UTF-8. Se lleva un contador `remaining` para
+  asegurar que los bytes consumidos coincidan con `length`; discrepancias levantan `ProtocolError`.
+- **Escritura**: las respuestas usan `sock.sendall`, que bloquea hasta enviar todo el buffer o falla, evitando **short writes**.
 
 ### Ejercicio N°7:
 
