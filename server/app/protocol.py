@@ -1,18 +1,20 @@
-import logging
 import socket
-import struct
-from typing import Tuple
-
-from common import utils
 
 
 class ProtocolError(Exception):
+    """Represents a framing/validation error while parsing or writing messages.
+
+    `opcode` optionally identifies the message context in which the error occurred.
+    """
+
     def __init__(self, message, opcode=None):
         super().__init__(message)
         self.opcode = opcode
 
 
 class Opcodes:
+    """Numeric opcodes of the wire protocol (u8)."""
+
     NEW_BETS = 0
     BETS_RECV_SUCCESS = 1
     BETS_RECV_FAIL = 2
@@ -21,9 +23,41 @@ class Opcodes:
     WINNERS = 5
 
 
+class RawBet:
+    """Transport-level bet structure read from the wire (not the domain model)."""
+
+    def __init__(
+        self,
+        agency: str,
+        first_name: str,
+        last_name: str,
+        document: str,
+        birthdate: str,
+        number: str,
+    ):
+        self.agency = agency
+        self.first_name = first_name
+        self.last_name = last_name
+        self.document = document
+        self.birthdate = birthdate
+        self.number = number
+
+
 class NewBets:
+    """Inbound NEW_BETS message.
+
+    Body layout:
+      [n_bets:i32 LE]
+      n_bets × {
+        [n_pairs:i32 LE == 6]
+        6 × [key:string][value:string]  // UTF-8 with i32 length prefix
+      }
+
+    Validates required keys and collects bets as `RawBet` instances.
+    """
+
     def __init__(self):
-        self.bets: list[utils.Bet] = []
+        self.bets: list[RawBet] = []
         self.opcode: int = Opcodes.NEW_BETS
         self.required = (
             "AGENCIA",
@@ -36,25 +70,24 @@ class NewBets:
         self.amount: int = 0
 
     def __read_pair(self, sock: socket.socket, remaining: int) -> tuple[str, str, int]:
+        """Read a single <key, value> pair, both as protocol [string]."""
         (key, remaining) = read_string(sock, remaining, self.opcode)
         (value, remaining) = read_string(sock, remaining, self.opcode)
         return (key, value, remaining)
 
     def __read_bet(self, sock: socket.socket, remaining: int) -> int:
+        """Read one bet map, enforce 6 pairs and required keys, append RawBet."""
         curr_bet: dict[str, str] = {}
         (n_pairs, remaining) = read_i32(sock, remaining, self.opcode)
         if n_pairs != 6:
             raise ProtocolError("invalid body", self.opcode)
-
-        for _ in range(n_pairs):
+        for _ in range(0, n_pairs):
             (k, v, remaining) = self.__read_pair(sock, remaining)
             curr_bet[k] = v
-
         if [k for k in self.required if k not in curr_bet]:
             raise ProtocolError("invalid body", self.opcode)
-
-        try:
-            bet = utils.Bet(
+        self.bets.append(
+            RawBet(
                 curr_bet["AGENCIA"],
                 curr_bet["NOMBRE"],
                 curr_bet["APELLIDO"],
@@ -62,13 +95,16 @@ class NewBets:
                 curr_bet["NACIMIENTO"],
                 curr_bet["NUMERO"],
             )
-        except (ValueError, TypeError) as e:
-            raise ProtocolError("invalid body", self.opcode) from e
-
-        self.bets.append(bet)
+        )
         return remaining
 
     def read_from(self, sock, length: int):
+        """Parse the complete NEW_BETS body and enforce exact-length consumption.
+
+        Reads the `n_bets` counter and then consumes each bet map. If, after
+        parsing, `remaining != 0`, raises ProtocolError. On parse failure, drains
+        the remaining bytes (to keep the stream synchronized) and re-raises.
+        """
         remaining = length
         try:
             n_bets, remaining = read_i32(sock, remaining, self.opcode)
@@ -86,12 +122,15 @@ class NewBets:
 
 
 class Finished:
+    """Inbound FINISHED message. Body is a single agency_id (i32 LE)."""
+
     def __init__(self):
         self.opcode = Opcodes.FINISHED
         self.agency_id = None
         self._length = 4
 
     def read_from(self, sock: socket.socket, length: int):
+        """Validate fixed body length (4) and read agency_id."""
         if length != self._length:
             raise ProtocolError("invalid length", self.opcode)
         (agency_id, _) = read_i32(sock, length, self.opcode)
@@ -99,12 +138,15 @@ class Finished:
 
 
 class RequestWinners:
+    """Inbound REQUEST_WINNERS message. Body is a single agency_id (i32 LE)."""
+
     def __init__(self):
         self.opcode = Opcodes.REQUEST_WINNERS
         self.agency_id = None
         self._length = 4
 
     def read_from(self, sock: socket.socket, length: int):
+        """Validate fixed body length (4) and read agency_id."""
         if length != self._length:
             raise ProtocolError("invalid length", self.opcode)
         (agency_id, _) = read_i32(sock, length, self.opcode)
@@ -112,8 +154,9 @@ class RequestWinners:
 
 
 def recv_exactly(sock: socket.socket, n: int) -> bytes:
-    """
-    Reads exactly n bytes or throws EOFError if peer closed before finishing.
+    """Read exactly n bytes (retrying as needed) or raise EOFError on peer close.
+
+    Converts timeouts/OS errors to ProtocolError. Prevents short reads.
     """
     if n < 0:
         raise ProtocolError("invalid body")
@@ -135,27 +178,29 @@ def recv_exactly(sock: socket.socket, n: int) -> bytes:
     return bytes(data)
 
 
-def read_struct(sock: socket.socket, fmt: str) -> Tuple:
-    """
-    Reads struct with endianness and types defined by fmt.
-    """
-    size = struct.calcsize(fmt)
-    buf = recv_exactly(sock, size)
-    return struct.unpack(fmt, buf)
-
-
 def read_u8(sock: socket.socket) -> int:
-    return read_struct(sock, "<B")[0]
+    """Read one unsigned byte (u8)."""
+    return recv_exactly(sock, 1)[0]
 
 
-def read_i32(sock: socket.socket, remaining: int, opcode: int) -> (int, int):
+def read_i32(sock: socket.socket, remaining: int, opcode: int) -> tuple[int, int]:
+    """Read a little-endian signed int32 and decrement `remaining` accordingly.
+
+    Raises ProtocolError if fewer than 4 bytes remain to be read.
+    """
     if remaining < 4:
         raise ProtocolError("indicated length doesn't match body length", opcode)
     remaining -= 4
-    return (read_struct(sock, "<i")[0], remaining)
+    val = int.from_bytes(recv_exactly(sock, 4), byteorder="little", signed=True)
+    return val, remaining
 
 
 def read_string(sock: socket.socket, remaining: int, opcode: int) -> (str, int):
+    """Read a protocol [string]: i32 length (validated) + UTF-8 bytes.
+
+    Ensures a strictly positive length and sufficient remaining payload.
+    Returns the decoded string and the updated `remaining`.
+    """
     (key_len, remaining) = read_i32(sock, remaining, opcode)
     if key_len <= 0:
         raise ProtocolError("invalid body", opcode)
@@ -170,6 +215,11 @@ def read_string(sock: socket.socket, remaining: int, opcode: int) -> (str, int):
 
 
 def recv_msg(sock: socket.socket):
+    """Read a single framed message and dispatch by opcode.
+
+    Reads opcode (u8) and length (i32 LE), validates length, then dispatches
+    to the appropriate message class. Raises ProtocolError on invalid opcode.
+    """
     opcode = read_u8(sock)
     (length, _) = read_i32(sock, 4, -1)
     if length < 0:
@@ -189,20 +239,20 @@ def recv_msg(sock: socket.socket):
     raise ProtocolError(f"invalid opcode: {opcode}")
 
 
-def write_struct(sock: socket.socket, fmt: str, *values) -> None:
-    data = struct.pack(fmt, *values)
-    sock.sendall(data)
-
-
-def write_u8(sock: socket.socket, value: int) -> None:
-    write_struct(sock, "<B", value)
+def write_u8(sock, value: int) -> None:
+    """Write a single unsigned byte (u8) using sendall()."""
+    if not 0 <= value <= 255:
+        raise ValueError("u8 out of range")
+    sock.sendall(bytes([value]))
 
 
 def write_i32(sock: socket.socket, value: int) -> None:
-    write_struct(sock, "<i", value)
+    """Write a little-endian signed int32 using sendall()."""
+    sock.sendall(int(value).to_bytes(4, byteorder="little", signed=True))
 
 
 def write_string(sock: socket.socket, s: str) -> None:
+    """Write a protocol [string]: i32 length prefix + UTF-8 bytes."""
     b = s.encode("utf-8")
     n = len(b)
     write_i32(sock, n)
@@ -210,29 +260,43 @@ def write_string(sock: socket.socket, s: str) -> None:
 
 
 class BetsRecvSuccess:
+    """Outbound BETS_RECV_SUCCESS response (empty body)."""
+
     def __init__(self):
         self.opcode = Opcodes.BETS_RECV_SUCCESS
 
     def write_to(self, sock: socket.socket):
+        """Frame and send the success response: [opcode][length=0]."""
         write_u8(sock, self.opcode)
         write_i32(sock, 0)
 
 
 class BetsRecvFail:
+    """Outbound BETS_RECV_FAIL response (empty body)."""
+
     def __init__(self):
         self.opcode = Opcodes.BETS_RECV_FAIL
 
     def write_to(self, sock: socket.socket):
+        """Frame and send the failure response: [opcode][length=0]."""
         write_u8(sock, self.opcode)
         write_i32(sock, 0)
 
 
 class Winners:
+    """Outbound WINNERS response.
+
+    Body layout:
+      [count:i32 LE]
+      count × [string]  // each is i32 length + UTF-8
+    """
+
     def __init__(self, winners: list[str]):
         self.opcode = Opcodes.WINNERS
         self.list = winners
 
     def write_to(self, sock: socket.socket):
+        """Frame and send the winners list using sendall() for each chunk."""
         body_length = 4
         for document in self.list:
             body_length += 4 + len(document)
