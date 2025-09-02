@@ -19,7 +19,11 @@ import (
 
 var log = logging.MustGetLogger("log")
 
-// ClientConfig Configuration used by the client
+// ClientConfig holds the runtime configuration for a client instance.
+// - ID: agency identifier as a string.
+// - ServerAddress: TCP address of the server (host:port).
+// - BetsFilePath: CSV path with the agency bets.
+// - BatchLimit: maximum number of bets per batch (upper bound besides the 8 KiB framing limit).
 type ClientConfig struct {
 	ID            string
 	ServerAddress string
@@ -27,14 +31,15 @@ type ClientConfig struct {
 	BatchLimit    int32
 }
 
-// Client Entity that encapsulates how
+// Client encapsulates the client behavior, including configuration and
+// the currently open TCP connection (if any).
 type Client struct {
 	config ClientConfig
 	conn   net.Conn
 }
 
-// NewClient Initializes a new client receiving the configuration
-// as a parameter
+// NewClient constructs a Client with the provided configuration.
+// The TCP connection is not opened here; see createClientSocket / SendBets.
 func NewClient(config ClientConfig) *Client {
 	client := &Client{
 		config: config,
@@ -42,6 +47,13 @@ func NewClient(config ClientConfig) *Client {
 	return client
 }
 
+// processNextBet reads a single CSV record from betsReader, converts it
+// to the protocol key/value map (including AGENCIA), and attempts to add
+// it to the current batch buffer via AddBetWithFlush. If adding this bet
+// would exceed either the 8 KiB framing limit or the configured BatchLimit,
+// the function triggers a flush of the current batch to c.conn and then
+// starts a new batch with this bet. The returned error is io.EOF when the
+// CSV is exhausted, or any I/O/serialization error encountered.
 func (c *Client) processNextBet(betsReader *csv.Reader, batchBuff *bytes.Buffer, betsCounter *int32) error {
 	betFields, err := betsReader.Read()
 	if err != nil {
@@ -61,6 +73,11 @@ func (c *Client) processNextBet(betsReader *csv.Reader, batchBuff *bytes.Buffer,
 	return nil
 }
 
+// buildAndSendBatches streams the CSV, incrementally building NewBets
+// bodies into batchBuff and flushing to c.conn as limits are reached.
+// On context cancellation, it flushes any partial batch and returns the
+// context error. On clean EOF, it flushes a final partial batch (if any)
+// and returns nil. Any serialization or socket error is returned.
 func (c *Client) buildAndSendBatches(ctx context.Context, betsReader *csv.Reader) error {
 	var batchBuff bytes.Buffer
 	var betsCounter int32 = 0
@@ -91,9 +108,9 @@ func (c *Client) buildAndSendBatches(ctx context.Context, betsReader *csv.Reader
 	return nil
 }
 
-// CreateClientSocket Initializes client socket. In case of
-// failure, error is printed in stdout/stderr and exit 1
-// is returned
+// createClientSocket dials the configured ServerAddress and assigns the
+// resulting connection to c.conn. On failure it logs a critical message
+// and returns the dial error; on success it returns nil.
 func (c *Client) createClientSocket() error {
 	conn, err := net.Dial("tcp", c.config.ServerAddress)
 	if err != nil {
@@ -108,7 +125,15 @@ func (c *Client) createClientSocket() error {
 	return nil
 }
 
-// SendBet Sends bet with the received parameters to the server, and waits for a response (success or fail)
+// SendBets is the high-level entry point. It:
+//  1. Opens the CSV and connects to the server.
+//  2. Starts a reader goroutine (readResponse) to consume server replies.
+//  3. Builds and streams batches (buildAndSendBatches) until EOF or cancellation.
+//  4. On success, sends FINISHED + REQUEST_WINNERS over the same connection.
+//  5. Waits for either context cancellation or the reader goroutine to finish.
+//
+// It guarantees connection closure on exit and uses deadlines to unblock
+// the reader goroutine on cancellation.
 func (c *Client) SendBets() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
@@ -135,8 +160,37 @@ func (c *Client) SendBets() {
 	}()
 
 	conn := c.conn
-	reader := bufio.NewReader(conn)
 	readDone := make(chan struct{})
+	readResponse(conn, readDone)
+
+	if err = <-writeDone; err != nil && !errors.Is(err, context.Canceled) {
+		log.Errorf("action: send_bets | result: fail | error: %v", err)
+		return
+	}
+
+	if err == nil {
+		c.sendFinishedAndAskForWinners(ctx)
+	}
+	select {
+	case <-ctx.Done():
+		_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		<-readDone
+		return
+	case <-readDone:
+		if tcp, ok := c.conn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+	}
+}
+
+// readResponse consumes server responses from conn in a dedicated goroutine.
+// It logs per-message results and terminates when:
+//   - an I/O error occurs (EOF included), or
+//   - a Winners message is received (explicit break to stop reading).
+//
+// The function closes readDone when the goroutine exits.
+func readResponse(conn net.Conn, readDone chan struct{}) {
+	reader := bufio.NewReader(conn)
 	go func() {
 	readLoop:
 		for {
@@ -162,44 +216,32 @@ func (c *Client) SendBets() {
 		}
 		close(readDone)
 	}()
+}
 
-	if err = <-writeDone; err != nil && !errors.Is(err, context.Canceled) {
-		log.Errorf("action: send_bets | result: fail | error: %v", err)
+// sendFinishedAndAskForWinners sends FINISHED (with the numeric agency ID)
+// and then REQUEST_WINNERS over the already open connection. It logs success
+// or failure for each write. On any serialization/I/O error it logs and returns.
+func (c *Client) sendFinishedAndAskForWinners(ctx context.Context) {
+	agencyId, err := strconv.Atoi(c.config.ID)
+	if err != nil {
+		log.Errorf("action: send_finished | result: fail | error: %v", err)
 		return
 	}
 
-	if err == nil {
-		agencyId, err := strconv.Atoi(c.config.ID)
-		if err != nil {
-			log.Errorf("action: send_finished | result: fail | error: %v", err)
-			return
-		}
-
-		finishedMsg := Finished{int32(agencyId)}
-		if _, err := finishedMsg.WriteTo(c.conn); err != nil {
-			log.Errorf("action: send_finished | result: fail | error: %v", err)
-			return
-		}
-
-		log.Infof("action: send_finished | result: success | agencyId: %d", int32(agencyId))
-
-		reqMsg := RequestWinners{int32(agencyId)}
-
-		if _, err := reqMsg.WriteTo(c.conn); err != nil {
-			log.Errorf("action: send_request_winners | result: fail | error: %v", err)
-			return
-		}
-
-		log.Infof("action: send_request_winners | result: success | agencyId: %d", int32(agencyId))
-	}
-	select {
-	case <-ctx.Done():
-		_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		<-readDone
+	finishedMsg := Finished{int32(agencyId)}
+	if _, err := finishedMsg.WriteTo(c.conn); err != nil {
+		log.Errorf("action: send_finished | result: fail | error: %v", err)
 		return
-	case <-readDone:
-		if tcp, ok := c.conn.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
-		}
 	}
+
+	log.Infof("action: send_finished | result: success | agencyId: %d", int32(agencyId))
+
+	reqMsg := RequestWinners{int32(agencyId)}
+
+	if _, err := reqMsg.WriteTo(c.conn); err != nil {
+		log.Errorf("action: send_request_winners | result: fail | error: %v", err)
+		return
+	}
+
+	log.Infof("action: send_request_winners | result: success | agencyId: %d", int32(agencyId))
 }
