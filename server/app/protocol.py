@@ -128,14 +128,15 @@ def read_struct(sock: socket.socket, fmt: str) -> Tuple:
 
 
 def read_u8(sock: socket.socket) -> int:
-    return read_struct(sock, "<B")[0]
+    return recv_exactly(sock, 1)[0]
 
 
-def read_i32(sock: socket.socket, remaining: int, opcode: int) -> (int, int):
+def read_i32(sock: socket.socket, remaining: int, opcode: int) -> tuple[int, int]:
     if remaining < 4:
         raise ProtocolError("indicated length doesn't match body length", opcode)
     remaining -= 4
-    return (read_struct(sock, "<i")[0], remaining)
+    val = int.from_bytes(recv_exactly(sock, 4), byteorder="little", signed=True)
+    return val, remaining
 
 
 def read_string(sock: socket.socket, remaining: int, opcode: int) -> (str, int):
@@ -175,17 +176,14 @@ def recv_msg(sock: socket.socket):
         raise ProtocolError(f"invalid opcode: {opcode}")
 
 
-def write_struct(sock: socket.socket, fmt: str, *values) -> None:
-    data = struct.pack(fmt, *values)
-    sock.sendall(data)
-
-
-def write_u8(sock: socket.socket, value: int) -> None:
-    write_struct(sock, "<B", value)
+def write_u8(sock, value: int) -> None:
+    if not 0 <= value <= 255:
+        raise ValueError("u8 out of range")
+    sock.sendall(bytes([value]))
 
 
 def write_i32(sock: socket.socket, value: int) -> None:
-    write_struct(sock, "<i", value)
+    sock.sendall(int(value).to_bytes(4, byteorder="little", signed=True))
 
 
 class BetsRecvSuccess:
