@@ -21,6 +21,11 @@ def store_bets(raw_bets: list[RawBet]) -> int:
 
 
 def compute_winners() -> dict[int, list[str]]:
+    """Compute and group winners by agency.
+
+    Loads all persisted bets, filters those that won (utils.has_won),
+    and returns a dict mapping agency_id -> list of winner documents.
+    """
     res: dict[int, list[str]] = {}
     for b in utils.load_bets():
         if utils.has_won(b):
