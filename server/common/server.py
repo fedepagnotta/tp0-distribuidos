@@ -5,7 +5,6 @@ import socket
 
 class Server:
     def __init__(self, port, listen_backlog):
-        # Initialize server socket
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.bind(("", port))
         self._server_socket.listen(listen_backlog)
@@ -40,16 +39,20 @@ class Server:
         client socket will also be closed
         """
         try:
-            # TODO: Modify the receive to avoid short-reads
-            msg = client_sock.recv(1024).rstrip().decode("utf-8")
+            rf = client_sock.makefile("rb")
+            line = rf.readline(64 * 1024)
+            if line == b"":
+                raise EOFError("peer closed connection")
+            msg = line.rstrip(b"\r\n").decode("utf-8")
             addr = client_sock.getpeername()
             logging.info(
-                f"action: receive_message | result: success | ip: {addr[0]} | msg: {msg}"
+                "action: receive_message | result: success | ip: %s | msg: %s",
+                addr[0],
+                msg,
             )
-            # TODO: Modify the send to avoid short-writes
-            client_sock.send("{}\n".format(msg).encode("utf-8"))
-        except OSError as e:
-            logging.error("action: receive_message | result: fail | error: {e}")
+            client_sock.sendall((msg + "\n").encode("utf-8"))
+        except (UnicodeDecodeError, EOFError, OSError) as e:
+            logging.error("action: receive_message | result: fail | error: %s", e)
         finally:
             client_sock.close()
 
@@ -60,8 +63,6 @@ class Server:
         Function blocks until a connection to a client is made.
         Then connection created is printed and returned
         """
-
-        # Connection arrived
         logging.info("action: accept_connections | result: in_progress")
         c, addr = self._server_socket.accept()
         logging.info(f"action: accept_connections | result: success | ip: {addr[0]}")
