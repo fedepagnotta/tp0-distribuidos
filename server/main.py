@@ -4,7 +4,7 @@ import logging
 import os
 from configparser import ConfigParser
 
-from common.server import Server
+from app.net import Server
 
 
 def initialize_config():
