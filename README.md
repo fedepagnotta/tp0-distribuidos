@@ -191,14 +191,6 @@ La corrección personal tendrá en cuenta la calidad del código entregado y cas
 
 ### Ejercicio N°1:
 
-#### Objetivo
-
-El script genera dinámicamente un archivo **Docker Compose** que define:
-
-- Un servicio **server**.
-- **N** servicios **client** numerados consecutivamente (**client1**, **client2**, …), donde **N** se pasa por parámetro.
-- Una **red** dedicada (`testing_net`) con un **subred** IPAM fijo.
-
 #### Interfaz y parámetros
 
 El script se invoca en la raíz del proyecto con:
@@ -331,6 +323,63 @@ networks:
         - subnet: 172.25.125.0/24
 ```
 
+#### Evitación de short-writes en client
+
+Se implementó la función `WriteFull`, que escribe un stream de bytes al socket utilizando un loop que chequea si todavía quedan bytes por escribir. Si efectivamente
+faltan, se vuelve a escribir utilizando la función `Write`, que devuelve la cantidad de bytes escritos, pero no devuelve error si hubo un short-write.
+
+```go
+func writeFull(conn net.Conn, b []byte) error {
+	for len(b) > 0 {
+		n, err := conn.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+```
+
+En `StartClientLoop` se utiliza esta función para escribir el mensaje.
+
+```go
+msg := fmt.Sprintf("[CLIENT %v] Message N°%v\n", c.config.ID, msgID)
+
+if err := writeFull(c.conn, []byte(msg)); err != nil {
+    log.Errorf("action: send | result: fail | client_id: %v | error: %v", c.config.ID, err)
+    return
+}
+```
+
+#### Evitación de short-reads y short-writes en server
+
+El manejo de la conexión con el cliente en `__handle_client_connection` fue modificado, tal que la lectura y escritura ahora se ven así:
+
+```python
+try:
+    rf = client_sock.makefile("rb")
+    line = rf.readline(64 * 1024)
+    if line == b"":
+        raise EOFError("peer closed connection")
+    msg = line.rstrip(b"\r\n").decode("utf-8")
+    addr = client_sock.getpeername()
+    logging.info(
+        "action: receive_message | result: success | ip: %s | msg: %s",
+        addr[0],
+        msg,
+    )
+    client_sock.sendall((msg + "\n").encode("utf-8"))
+except (UnicodeDecodeError, EOFError, OSError) as e:
+    logging.error("action: receive_message | result: fail | error: %s", e)
+finally:
+    client_sock.close()
+```
+
+Se puede observar que se utiliza la función `makefile` para crear un stream de bytes para solo lectura conectado al socket, a partir del cual se leen hasta
+64kB del socket con la función `readline`, que internamente hace los recv necesarios para evitar short-reads.
+Por otro lado, para la escritura se utiliza `sendall`, que evita short-writes internamente, ya que garantiza enviar todo el buffer o fallar.
+
 ### Ejercicio N°2:
 
 #### Cambios en el Dockerfile del cliente
@@ -436,92 +485,90 @@ requieren puertos publicados hacia el host ni instalación de herramientas fuera
 Se utiliza **Alpine** por ser una base **ligera**, con un conjunto de herramientas **acotado** y suficiente para el objetivo del ejercicio.
 Permite instalar `netcat-openbsd` de forma simple y mantener la imagen mínima necesaria para ejecutar la validación.
 
-### Ejercicio N°4:
+### Ejercicio N°4
 
 #### Server
 
-Se utilizó un nuevo parámetro `_running` en la clase `Server`, que se inicializa en `False`, y en el método `Server.run()` se setea a `True`. La condición del `while`
-pasa a chequear ese parámetro, de tal forma que, al convertirse en `False`, se dejan de aceptar nuevas conexiones.
+**Resumen.** El servidor atiende conexiones secuencialmente. Al recibir `SIGTERM`, deja de aceptar nuevas conexiones cerrando el **socket de escucha** y
+sale del loop principal. Cada conexión se procesa de punta a punta (leer 1 línea, loguear, hacer echo, cerrar).
 
-Para cambiar el valor de `_running` se creó un handler para la señal `SIGTERM`. En este handler, llamado `__stop_running`, se setea `_running` a `False`, y se cierra
-el `socket` del server (`Server._server_socket`). Al cerrar el `socket` se evita que el el proceso quede bloqueado esperando una nueva conexión de un cliente, ya que se
-podría dar que se chequea la condición del `while`, se cumple esa condición, se pasa a esperar una nueva conexión, y recién ahí llega un `SIGTERM`. Cerrando el socket
-hacemos que falle el `accept()` con `OSError`, y ahí se chequea si `self._running == False`, y en ese caso se rompe el loop en vez de propagar el error.
+##### Puntos clave
 
-Cuando se sale del loop principal de `run`, se llama a `logging.shutdown()` para flushear buffers y liberar recursos utilizados para logging.
-
-En resumen: al recibir `SIGTERM`, se drena la última conexión establecida con un cliente y se dejan de aceptar conexiones nuevas.
-
-Versión final de `run()`:
+- **Loop principal con corte por señal**
 
 ```python
-    def run(self):
-        """
-        Dummy Server loop
-
-        Server that accept a new connections and establishes a
-        communication with a client. After client with communucation
-        finishes, servers starts to accept new connections again
-        """
-
-        self._running = True
-        signal.signal(signal.SIGTERM, self.__stop_running)
-        while self._running:
-            try:
-                client_sock = self.__accept_new_connection()
-                self.__handle_client_connection(client_sock)
-            except OSError:
-                if not self._running:
-                    break
-                raise
-        logging.shutdown()
+def run(self):
+    self._running = True
+    signal.signal(signal.SIGTERM, self.__stop_running)
+    while self._running:
+        try:
+            client_sock = self.__accept_new_connection()
+            self.__handle_client_connection(client_sock)
+        except OSError:
+            if not self._running:
+                break
+            raise
+    logging.shutdown()
 ```
 
-Versión final de `__stop_running()`:
+- **Handler de SIGTERM**: marca el stop y **cierra el listener** para “desbloquear” `accept()` con un `OSError` controlado:
 
 ```python
-    def __stop_running(self, signum, frame):
-        self._running = False
-        self._server_socket.close()
+def __stop_running(self, signum, frame):
+    self._running = False
+    self._server_socket.close()
 ```
 
-#### Client
+**Qué garantiza el servidor**
 
-Se utilizó un `context` creado con `signal.NotifyContext`, para "bypassear" el comportamiento por defecto de Go a la hora de recibir señales `SIGTERM`. En otras palabras,
-`signal.NotifyContext` convierte `SIGTERM` en cancelación de contexto, lo que permite handlear la interrupción, limpiando lo necesario y terminando de forma ordenada.
+- **No quedan bloqueos**: cerrar el listener hace que `accept()` despierte y el loop finalice.
+- **Lecturas/escrituras completas**: `readline()` y `sendall()` manejan internamente **short read/write**.
+- **Cierre ordenado**: cada socket del cliente se cierra en `finally`; al final, `logging.shutdown()` drena los buffers de log.
 
-Este contexto se creó en la función `StartClientLoop`. Seguido de esto, se utilizó `defer stop()` para posponer la interrupción del programa hasta que la función
-retorne. De esta forma, se puede handlear la señal, hacer un `graceful shutdown`, y finalmente terminar la ejecución.
+#### Cliente
 
-El loop de `StartClientLoop` fue modificado, quedando así:
+**Resumen.** El cliente envía `LoopAmount` mensajes, uno cada `LoopPeriod`. Usa `signal.NotifyContext` para convertir `SIGTERM` en
+**cancelación de contexto**, lo que le permite interrumpir de forma limpia: fija `ReadDeadline`, espera a terminar una lectura pendiente
+y cierra la conexión actual.
+
+##### Puntos clave
+
+- **Contexto cancelable por SIGTERM**
 
 ```go
-for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
-    select {
-    case <-ctx.Done():
-        return
-    default:
-    }
-    // Create the connection the server in every loop iteration. Send an
-    c.createClientSocket()
+ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+defer stop()
+```
 
-    // TODO: Modify the send to avoid short-write
-    fmt.Fprintf(
-        c.conn,
-        "[CLIENT %v] Message N°%v\n",
-        c.config.ID,
-        msgID,
-    )
+- **Conexión por iteración + cierre garantizado**
 
-    readDone := make(chan struct{})
-    var msg string
-    var err error
-    go func() {
-        msg, err = bufio.NewReader(c.conn).ReadString('\n')
-        close(readDone)
-    }()
+```go
+conn, derr := net.Dial("tcp", c.config.ServerAddress)
+if derr != nil { /* log y return */ }
+c.conn = conn
+defer conn.Close() // cierra esta conexión pase lo que pase en la iteración
+```
 
-    timer := time.NewTimer(c.config.LoopPeriod)
+- **Lectura en goroutine + sincronización + timer**
+
+```go
+readDone := make(chan struct{})
+var msg string
+var err error
+go func() {
+    msg, err = bufio.NewReader(c.conn).ReadString('\n')
+    close(readDone)
+}()
+
+timer := time.NewTimer(c.config.LoopPeriod)
+select {
+case <-ctx.Done():
+    _ = c.conn.SetReadDeadline(time.Now()) // desbloquea ReadString
+    <-readDone
+    timer.Stop()
+    c.conn.Close()
+    return
+case <-timer.C:
     select {
     case <-ctx.Done():
         _ = c.conn.SetReadDeadline(time.Now())
@@ -529,47 +576,29 @@ for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
         timer.Stop()
         c.conn.Close()
         return
-    case <-timer.C:
-        select {
-        case <-ctx.Done():
-            _ = c.conn.SetReadDeadline(time.Now())
-            <-readDone
-            timer.Stop()
-            c.conn.Close()
-            return
-        case <-readDone:
-            c.conn.Close()
-            if err != nil {
-                log.Errorf("action: receive_message | result: fail | client_id: %v | error: %v",
-                    c.config.ID,
-                    err,
-                )
-                return
-            }
-            log.Infof("action: receive_message | result: success | client_id: %v | msg: %v",
-                c.config.ID,
-                msg,
-            )
-        }
+    case <-readDone:
+        c.conn.Close()
+        if err != nil { /* log fail y return */ }
+        log.Infof("action: receive_message | result: success | client_id: %v | msg: %v", c.config.ID, msg)
     }
 }
 ```
 
-Veámoslo en detalle:
+**Qué garantiza el cliente**
 
-1. Al principio de cada iteración se agregó un chequeo, para ver si la señal ya había sido notificada en el contexto.
-2. La lectura del buffer se pasó a una `goroutine`, que cierra un canal `readDone` al finalizar la lectura.
-3. En vez de hacer un `sleep` para separar los envíos del cliente, se utilizó un `timer`, y luego, utilizando un `select`, la main routine quedó bloqueada
-   esperando la señal del contexto (el `SIGTERM`), o la señal del timer (la finalización del `LoopPeriod` seteado en el archivo de configuración).
+- **Terminación limpia ante `SIGTERM`**: si el cliente está esperando respuesta, se fuerza un deadline de lectura para **desbloquear**
+  la goroutine lectora, se espera a que termine y se cierran los recursos.
+- **Sin short-write**: el `bufio.Writer` + `Flush()` aseguran que el mensaje se envíe completo antes de continuar.
+- **Cierre explícito por iteración**: cada conexión se cierra antes de pasar al siguiente envío. El `defer conn.Close()` local
+  asegura el cierre incluso ante retornos tempranos.
 
-- Si lo primero en suceder es que llega el `SIGTERM`, se setea un deadline para la operación de lectura que estaba realizando la goroutine, haciendo que se interrumpa
-  la misma. Luego, se espera a que se cierre el canal `readDone` para frenar el `timer`, cerrar el `socket` del cliente, y retornar para ejecutar el `stop()` del `defer`.
-- Si lo primero en suceder es que se termina el timer, se vuelve a hacer un `select`, esta vez esperando al `SIGTERM` o a que se finalice la lectura de la `goroutine`.
-  Si llega el `SIGTERM` primero, se ejecuta el flujo mencionado justo arriba. En caso contrario, simplemente se cierra el socket de la iteración actual, y se loggea el
-  resultado correspondiente.
+#### Resultado
 
-De esta forma, tanto la lectura como la espera entre envíos al servidor son interrumpibles de forma ordenada, y se puede realizar un `graceful shutdown` al recibir un
-`SIGTERM`.
+Con este diseño, ambos procesos cumplen con **graceful shutdown**:
+
+- El servidor **deja de aceptar nuevas conexiones** y **drena** la conexión en curso.
+- El cliente **interrumpe lecturas bloqueadas**, **cierra la conexión** de la iteración y **termina ordenadamente**.
+- Se evitan **short reads/writes** y se **registran** los eventos relevantes de cierre y de I/O.
 
 ### Ejercicio N°5:
 
