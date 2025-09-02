@@ -19,7 +19,11 @@ import (
 
 var log = logging.MustGetLogger("log")
 
-// ClientConfig Configuration used by the client
+// ClientConfig holds the runtime configuration for a client instance.
+// - ID: agency identifier as a string.
+// - ServerAddress: TCP address of the server (host:port).
+// - BetsFilePath: CSV path with the agency bets.
+// - BatchLimit: maximum number of bets per batch (upper bound besides the 8 KiB framing limit).
 type ClientConfig struct {
 	ID            string
 	ServerAddress string
@@ -27,14 +31,15 @@ type ClientConfig struct {
 	BatchLimit    int32
 }
 
-// Client Entity that encapsulates how
+// Client encapsulates the client behavior, including configuration and
+// the currently open TCP connection (if any).
 type Client struct {
 	config ClientConfig
 	conn   net.Conn
 }
 
-// NewClient Initializes a new client receiving the configuration
-// as a parameter
+// NewClient constructs a Client with the provided configuration.
+// The TCP connection is not opened here; see createClientSocket / SendBets.
 func NewClient(config ClientConfig) *Client {
 	client := &Client{
 		config: config,
@@ -42,6 +47,13 @@ func NewClient(config ClientConfig) *Client {
 	return client
 }
 
+// processNextBet reads a single CSV record from betsReader, converts it
+// to the protocol key/value map (including AGENCIA), and attempts to add
+// it to the current batch buffer via AddBetWithFlush. If adding this bet
+// would exceed either the 8 KiB framing limit or the configured BatchLimit,
+// the function triggers a flush of the current batch to c.conn and then
+// starts a new batch with this bet. The returned error is io.EOF when the
+// CSV is exhausted, or any I/O/serialization error encountered.
 func (c *Client) processNextBet(betsReader *csv.Reader, batchBuff *bytes.Buffer, betsCounter *int32) error {
 	betFields, err := betsReader.Read()
 	if err != nil {
@@ -61,6 +73,11 @@ func (c *Client) processNextBet(betsReader *csv.Reader, batchBuff *bytes.Buffer,
 	return nil
 }
 
+// buildAndSendBatches streams the CSV, incrementally building NewBets
+// bodies into batchBuff and flushing to c.conn as limits are reached.
+// On context cancellation, it flushes any partial batch and returns the
+// context error. On clean EOF, it flushes a final partial batch (if any)
+// and returns nil. Any serialization or socket error is returned.
 func (c *Client) buildAndSendBatches(ctx context.Context, betsReader *csv.Reader) error {
 	var batchBuff bytes.Buffer
 	var betsCounter int32 = 0
@@ -91,9 +108,9 @@ func (c *Client) buildAndSendBatches(ctx context.Context, betsReader *csv.Reader
 	return nil
 }
 
-// CreateClientSocket Initializes client socket. In case of
-// failure, error is printed in stdout/stderr and exit 1
-// is returned
+// createClientSocket dials the configured ServerAddress and assigns the
+// resulting connection to c.conn. On failure it logs a critical message
+// and returns the dial error; on success it returns nil.
 func (c *Client) createClientSocket() error {
 	conn, err := net.Dial("tcp", c.config.ServerAddress)
 	if err != nil {
@@ -108,7 +125,14 @@ func (c *Client) createClientSocket() error {
 	return nil
 }
 
-// SendBet Sends bet with the received parameters to the server, and waits for a response (success or fail)
+// SendBets drives the client lifecycle for sending batches.
+// - Installs a SIGTERM-aware context for graceful cancellation.
+// - Opens the CSV, connects once, and starts:
+//   - writer goroutine: buildAndSendBatches(ctx, betsReader)
+//   - reader goroutine: readResponse(conn, readDone) for batch acks
+//   - Waits for the writer; on success, triggers sendFinishedAndAskForWinners(ctx).
+//   - On cancellation, sets a short read deadline to unblock the reader and exits.
+//     Otherwise, waits for the reader to finish and half-closes the write side.
 func (c *Client) SendBets() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
@@ -159,6 +183,10 @@ func (c *Client) SendBets() {
 	}
 }
 
+// readResponse consumes server responses on a dedicated goroutine.
+//   - Decodes framed replies from conn and logs success/failure per batch.
+//   - Stops on I/O error or EOF, then closes readDone to signal completion.
+//     (WINNERS is not handled here; it is retrieved separately.)
 func readResponse(conn net.Conn, readDone chan struct{}) {
 	reader := bufio.NewReader(conn)
 	go func() {
@@ -181,6 +209,11 @@ func readResponse(conn net.Conn, readDone chan struct{}) {
 	}()
 }
 
+// sendFinishedAndAskForWinners finalizes the upload and fetches winners.
+//   - Sends FINISHED (agency id) on the current connection.
+//   - Then, in a retry loop, opens short-lived connections to send REQUEST_WINNERS,
+//     reads a single reply, and stops when a WINNERS message arrives.
+//   - Honors ctx cancellation between retries; logs each attempt and error.
 func (c *Client) sendFinishedAndAskForWinners(ctx context.Context) {
 	agencyId, err := strconv.Atoi(c.config.ID)
 	if err != nil {

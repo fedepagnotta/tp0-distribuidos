@@ -15,6 +15,8 @@ const FinishedOpCode byte = 3
 const RequestWinnersOpCode byte = 4
 const WinnersOpCode byte = 5
 
+// ProtocolError models a framing/validation error while parsing or writing
+// protocol messages. Opcode, when present, indicates the message context.
 type ProtocolError struct {
 	Msg    string
 	Opcode byte
@@ -24,27 +26,31 @@ func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("protocol error: %s (opcode=%d)", e.Msg, e.Opcode)
 }
 
+// Message is implemented by all protocol messages and exposes the opcode
+// and the computed body length (for outbound messages).
 type Message interface {
 	GetOpCode() byte
 	GetLength() int32
 }
 
+// Writeable is implemented by outbound messages that can serialize themselves
+// to the wire format: [opcode:1][length:i32 LE][body]. It returns the total
+// number of bytes written (header + body) and any I/O error.
 type Writeable interface {
 	WriteTo(out io.Writer) (int32, error)
 }
 
+// Finished is a client→server message that indicates the agency finished
+// sending all its bets. Body: [agencyId:i32].
 type Finished struct {
 	AgencyId int32
 }
 
-func (msg *Finished) GetOpCode() byte {
-	return FinishedOpCode
-}
+func (msg *Finished) GetOpCode() byte  { return FinishedOpCode }
+func (msg *Finished) GetLength() int32 { return 4 }
 
-func (msg *Finished) GetLength() int32 {
-	return 4
-}
-
+// WriteTo writes the FINISHED frame with little-endian length and agencyId.
+// It returns the total bytes written (1 + 4 + 4) or an error.
 func (msg *Finished) WriteTo(out io.Writer) (int32, error) {
 	if err := binary.Write(out, binary.LittleEndian, msg.GetOpCode()); err != nil {
 		return 0, err
@@ -58,18 +64,17 @@ func (msg *Finished) WriteTo(out io.Writer) (int32, error) {
 	return 5 + msg.GetLength(), nil
 }
 
+// RequestWinners is a client→server message that asks for the winners list
+// for a given agency. Body: [agencyId:i32].
 type RequestWinners struct {
 	AgencyId int32
 }
 
-func (msg *RequestWinners) GetOpCode() byte {
-	return RequestWinnersOpCode
-}
+func (msg *RequestWinners) GetOpCode() byte  { return RequestWinnersOpCode }
+func (msg *RequestWinners) GetLength() int32 { return 4 }
 
-func (msg *RequestWinners) GetLength() int32 {
-	return 4
-}
-
+// WriteTo writes the REQUEST_WINNERS frame with little-endian fields.
+// It returns the total bytes written (1 + 4 + 4) or an error.
 func (msg *RequestWinners) WriteTo(out io.Writer) (int32, error) {
 	if err := binary.Write(out, binary.LittleEndian, msg.GetOpCode()); err != nil {
 		return 0, err
@@ -83,6 +88,7 @@ func (msg *RequestWinners) WriteTo(out io.Writer) (int32, error) {
 	return 5 + msg.GetLength(), nil
 }
 
+// writeString writes a protocol [string]: length (i32 LE) + UTF-8 bytes.
 func writeString(buff *bytes.Buffer, s string) error {
 	if err := binary.Write(buff, binary.LittleEndian, int32(len(s))); err != nil {
 		return err
@@ -91,6 +97,7 @@ func writeString(buff *bytes.Buffer, s string) error {
 	return err
 }
 
+// writePair writes a protocol key/value pair as two [string]s in sequence.
 func writePair(buff *bytes.Buffer, k string, v string) error {
 	if err := writeString(buff, k); err != nil {
 		return err
@@ -98,6 +105,8 @@ func writePair(buff *bytes.Buffer, k string, v string) error {
 	return writeString(buff, v)
 }
 
+// writeStringMap writes a protocol [string map]:
+// first the number of pairs (i32 LE) and then each <k, v> as [string][string].
 func writeStringMap(buff *bytes.Buffer, body map[string]string) error {
 	if err := binary.Write(buff, binary.LittleEndian, int32(len(body))); err != nil {
 		return err
@@ -110,12 +119,13 @@ func writeStringMap(buff *bytes.Buffer, body map[string]string) error {
 	return nil
 }
 
-// Serializes the bet and adds it to the writer, incrementing the betsCounter.
-// If the full NewBets package would exceed 8kB or the amount of bets would exceed the batchLimit, the bet is not
-// added to the body, instead the full NewBets package is built (adding the opcode, body length, and `betsCounter`,
-// that represents the amount of bets) and written to finalOutput. Finally, the body is empty and the bet is added,
-// reseting the betsCounter to 1.
-// Returns the error if some i/o operation failed.
+// AddBetWithFlush serializes a single bet as a [string map] and attempts to
+// append it to the current batch buffer `to`. If appending would exceed the
+// 8 KiB package limit (including opcode+length+n headers) or the given
+// batchLimit, this function first FlushBatch(to, finalOutput, *betsCounter)
+// and then starts a new batch with this bet, setting *betsCounter = 1.
+// On success, it increments *betsCounter and returns nil; any I/O/encoding
+// error is returned.
 func AddBetWithFlush(bet map[string]string, to *bytes.Buffer, finalOutput io.Writer, betsCounter *int32, batchLimit int32) error {
 	var buff bytes.Buffer
 	if err := writeStringMap(&buff, bet); err != nil {
@@ -139,6 +149,12 @@ func AddBetWithFlush(bet map[string]string, to *bytes.Buffer, finalOutput io.Wri
 	return nil
 }
 
+// FlushBatch frames and writes a NewBets message to `out` from the accumulated
+// body in `batch`. The wire format is:
+//
+//	[opcode=NewBets:1][length=i32 LE (4 + bodyLen)][nBets=i32 LE][body]
+//
+// After a successful write it resets the batch buffer. Any write error is returned.
 func FlushBatch(batch *bytes.Buffer, out io.Writer, betsCounter int32) error {
 	if err := binary.Write(out, binary.LittleEndian, NewBetsOpCode); err != nil {
 		return err
@@ -156,21 +172,22 @@ func FlushBatch(batch *bytes.Buffer, out io.Writer, betsCounter int32) error {
 	return nil
 }
 
+// Readable is implemented by inbound messages that can parse themselves
+// from a bufio.Reader, consuming exactly their body according to framing.
 type Readable interface {
 	readFrom(reader *bufio.Reader) error
 	Message
 }
 
+// BetsRecvSuccess is the server→client acknowledgment for a batch processed
+// successfully. Its body length is always 0.
 type BetsRecvSuccess struct{}
 
-func (msg *BetsRecvSuccess) GetOpCode() byte {
-	return BetsRecvSuccessOpCode
-}
+func (msg *BetsRecvSuccess) GetOpCode() byte  { return BetsRecvSuccessOpCode }
+func (msg *BetsRecvSuccess) GetLength() int32 { return 0 }
 
-func (msg *BetsRecvSuccess) GetLength() int32 {
-	return 0
-}
-
+// readFrom validates that the next i32 body length is exactly 0.
+// It consumes the field and returns nil on success.
 func (msg *BetsRecvSuccess) readFrom(reader *bufio.Reader) error {
 	var length int32
 	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
@@ -182,16 +199,15 @@ func (msg *BetsRecvSuccess) readFrom(reader *bufio.Reader) error {
 	return nil
 }
 
+// BetsRecvFail is the server→client negative acknowledgment for a batch.
+// Its body length is always 0.
 type BetsRecvFail struct{}
 
-func (msg *BetsRecvFail) GetOpCode() byte {
-	return BetsRecvFailOpCode
-}
+func (msg *BetsRecvFail) GetOpCode() byte  { return BetsRecvFailOpCode }
+func (msg *BetsRecvFail) GetLength() int32 { return 0 }
 
-func (msg *BetsRecvFail) GetLength() int32 {
-	return 0
-}
-
+// readFrom validates that the next i32 body length is exactly 0.
+// It consumes the field and returns nil on success.
 func (msg *BetsRecvFail) readFrom(reader *bufio.Reader) error {
 	var length int32
 	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
@@ -203,14 +219,16 @@ func (msg *BetsRecvFail) readFrom(reader *bufio.Reader) error {
 	return nil
 }
 
+// Winners is the server→client response listing winner documents for an agency.
+// Body format: [n:i32 LE][n × [string]] where [string] is length-prefixed UTF-8.
 type Winners struct {
 	List []string
 }
 
-func (msg *Winners) GetOpCode() byte {
-	return WinnersOpCode
-}
+func (msg *Winners) GetOpCode() byte { return WinnersOpCode }
 
+// GetLength computes the body length: 4 bytes for n plus each string's
+// 4-byte length prefix and its bytes.
 func (msg *Winners) GetLength() int32 {
 	var totalLen int32 = 4
 	for _, doc := range msg.List {
@@ -219,6 +237,9 @@ func (msg *Winners) GetLength() int32 {
 	return totalLen
 }
 
+// readFrom parses the Winners body defensively, validating remaining counters,
+// string lengths, and consuming exactly the advertised number of bytes.
+// It appends each winner ID to msg.List and returns nil on success.
 func (msg *Winners) readFrom(reader *bufio.Reader) error {
 	var remaining int32
 	if err := binary.Read(reader, binary.LittleEndian, &remaining); err != nil {
@@ -263,7 +284,11 @@ func (msg *Winners) readFrom(reader *bufio.Reader) error {
 	return nil
 }
 
-// reads contents from reader and returns the parsed package
+// ReadMessage reads exactly one framed server response from reader.
+// It consumes the opcode, dispatches to the message parser (which
+// validates and consumes the body), and returns the parsed message.
+// On invalid opcode or framing, a ProtocolError is returned; on I/O
+// issues, the underlying error is returned.
 func ReadMessage(reader *bufio.Reader) (Readable, error) {
 	var opcode byte
 	var err error
