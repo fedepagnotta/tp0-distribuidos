@@ -3,7 +3,7 @@ import signal
 import socket
 import threading
 
-from common import communication, utils
+from app import protocol, service
 
 
 class Server:
@@ -44,7 +44,6 @@ class Server:
         Function blocks until a connection to a client is made.
         Then connection created is printed and returned
         """
-        # Connection arrived
         logging.info("action: accept_connections | result: in_progress")
         c, addr = self._server_socket.accept()
         logging.info(f"action: accept_connections | result: success | ip: {addr[0]}")
@@ -54,7 +53,7 @@ class Server:
         while not self._stop.is_set():
             msg = None
             try:
-                msg = communication.recv_msg(client_sock)
+                msg = protocol.recv_msg(client_sock)
                 addr = client_sock.getpeername()
                 logging.info(
                     "action: receive_message | result: success | ip: %s | opcode: %i",
@@ -63,7 +62,7 @@ class Server:
                 )
                 if not self.__process_msg(msg, client_sock):
                     break
-            except communication.ProtocolError as e:
+            except protocol.ProtocolError as e:
                 logging.error("action: receive_message | result: fail | error: %s", e)
             except EOFError:
                 break
@@ -73,10 +72,10 @@ class Server:
         client_sock.close()
 
     def __process_msg(self, msg, client_sock) -> bool:
-        if msg.opcode == communication.Opcodes.NEW_BETS:
+        if msg.opcode == protocol.Opcodes.NEW_BETS:
             try:
                 with self._storage_lock:
-                    utils.store_bets(msg.bets)
+                    service.store_bets(msg.bets)
                     for bet in msg.bets:
                         logging.info(
                             "action: apuesta_almacenada | result: success | dni: %s | numero: %s",
@@ -84,7 +83,7 @@ class Server:
                             bet.number,
                         )
             except Exception as e:
-                communication.BetsRecvFail().write_to(client_sock)
+                protocol.BetsRecvFail().write_to(client_sock)
                 logging.error(
                     "action: apuesta_recibida | result: fail | cantidad: %d", msg.amount
                 )
@@ -93,25 +92,22 @@ class Server:
                 "action: apuesta_recibida | result: success | cantidad: %d",
                 msg.amount,
             )
-            communication.BetsRecvSuccess().write_to(client_sock)
+            protocol.BetsRecvSuccess().write_to(client_sock)
             return True
-        if msg.opcode == communication.Opcodes.FINISHED:
+        if msg.opcode == protocol.Opcodes.FINISHED:
             self._finished.wait()
             with self._raffle_lock:
                 if not self._raffle_done.is_set():
                     self.__raffle()
             return True
-        if msg.opcode == communication.Opcodes.REQUEST_WINNERS:
+        if msg.opcode == protocol.Opcodes.REQUEST_WINNERS:
             self._raffle_done.wait()
             self.__send_winners(msg.agency_id, client_sock)
             return False
 
     def __raffle(self):
         try:
-            bets = utils.load_bets()
-            winners = [(b.agency, b.document) for b in bets if utils.has_won(b)]
-            for w in winners:
-                self._winners.setdefault(w[0], []).append(w[1])
+            self._winners = service.compute_winners()
             logging.info("action: sorteo | result: success")
             self._raffle_done.set()
         except Exception as e:
@@ -120,11 +116,11 @@ class Server:
 
     def __send_winners(self, agency_id, sock):
         try:
-            communication.Winners(self._winners.get(agency_id, [])).write_to(sock)
+            protocol.Winners(self._winners.get(agency_id, [])).write_to(sock)
             logging.info(
                 "action: enviar_ganadores | result: success | agencia: %d", agency_id
             )
-        except communication.ProtocolError as e:
+        except protocol.ProtocolError as e:
             logging.error(
                 "action: enviar_ganadores | result: fail | agencia: %d | error: %s",
                 agency_id,
