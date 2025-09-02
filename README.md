@@ -647,6 +647,6 @@ El servidor se organiza en tres módulos:
 
 **Robustez de E/S**
 
-- **Lectura**: `recv_exactly` reintenta hasta completar; `read_struct`/`read_string` controlan tamaños y UTF-8. Se lleva un contador `remaining` para
+- **Lectura**: `recv_exactly` reintenta hasta completar; `read_i32`/`read_u8`/`read_string` controlan tamaños y UTF-8. Se lleva un contador `remaining` para
   asegurar que los bytes consumidos coincidan con `length`; discrepancias levantan `ProtocolError`.
 - **Escritura**: las respuestas usan `sock.sendall`, que bloquea hasta enviar todo el buffer o falla, evitando **short writes**.
