@@ -191,14 +191,6 @@ La corrección personal tendrá en cuenta la calidad del código entregado y cas
 
 ### Ejercicio N°1:
 
-#### Objetivo
-
-El script genera dinámicamente un archivo **Docker Compose** que define:
-
-- Un servicio **server**.
-- **N** servicios **client** numerados consecutivamente (**client1**, **client2**, …), donde **N** se pasa por parámetro.
-- Una **red** dedicada (`testing_net`) con un **subred** IPAM fijo.
-
 #### Interfaz y parámetros
 
 El script se invoca en la raíz del proyecto con:
@@ -331,6 +323,63 @@ networks:
         - subnet: 172.25.125.0/24
 ```
 
+#### Evitación de short-writes en client
+
+Se implementó la función `WriteFull`, que escribe un stream de bytes al socket utilizando un loop que chequea si todavía quedan bytes por escribir. Si efectivamente
+faltan, se vuelve a escribir utilizando la función `Write`, que devuelve la cantidad de bytes escritos, pero no devuelve error si hubo un short-write.
+
+```go
+func writeFull(conn net.Conn, b []byte) error {
+	for len(b) > 0 {
+		n, err := conn.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+```
+
+En `StartClientLoop` se utiliza esta función para escribir el mensaje.
+
+```go
+msg := fmt.Sprintf("[CLIENT %v] Message N°%v\n", c.config.ID, msgID)
+
+if err := writeFull(c.conn, []byte(msg)); err != nil {
+    log.Errorf("action: send | result: fail | client_id: %v | error: %v", c.config.ID, err)
+    return
+}
+```
+
+#### Evitación de short-reads y short-writes en server
+
+El manejo de la conexión con el cliente en `__handle_client_connection` fue modificado, tal que la lectura y escritura ahora se ven así:
+
+```python
+try:
+    rf = client_sock.makefile("rb")
+    line = rf.readline(64 * 1024)
+    if line == b"":
+        raise EOFError("peer closed connection")
+    msg = line.rstrip(b"\r\n").decode("utf-8")
+    addr = client_sock.getpeername()
+    logging.info(
+        "action: receive_message | result: success | ip: %s | msg: %s",
+        addr[0],
+        msg,
+    )
+    client_sock.sendall((msg + "\n").encode("utf-8"))
+except (UnicodeDecodeError, EOFError, OSError) as e:
+    logging.error("action: receive_message | result: fail | error: %s", e)
+finally:
+    client_sock.close()
+```
+
+Se puede observar que se utiliza la función `makefile` para crear un stream de bytes para solo lectura conectado al socket, a partir del cual se leen hasta
+64kB del socket con la función `readline`, que internamente hace los recv necesarios para evitar short-reads.
+Por otro lado, para la escritura se utiliza `sendall`, que evita short-writes internamente, ya que garantiza enviar todo el buffer o fallar.
+
 ### Ejercicio N°2:
 
 #### Cambios en el Dockerfile del cliente
@@ -361,7 +410,7 @@ networks:
 - Modificar `./server/config.ini` o `./client/config.yaml` en el host impacta inmediatamente en los contenedores al reiniciarlos, **sin reconstrucción** de imágenes.
 - El montaje en `:ro` asegura que los contenedores **no** modifiquen los archivos de configuración del host.
 
-### Ejercicio N°2:
+### Ejercicio N°3:
 
 #### Enfoque general
 
