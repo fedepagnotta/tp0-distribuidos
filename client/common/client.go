@@ -37,6 +37,17 @@ func NewClient(config ClientConfig) *Client {
 	return client
 }
 
+func writeFull(conn net.Conn, b []byte) error {
+	for len(b) > 0 {
+		n, err := conn.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
 // StartClientLoop Send messages to the client until some time threshold is met
 func (c *Client) StartClientLoop() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
@@ -62,12 +73,9 @@ func (c *Client) StartClientLoop() {
 		c.conn = conn
 		defer conn.Close()
 
-		w := bufio.NewWriter(c.conn)
-		if _, err := w.WriteString(fmt.Sprintf("[CLIENT %v] Message N°%v\n", c.config.ID, msgID)); err != nil {
-			log.Errorf("action: send | result: fail | client_id: %v | error: %v", c.config.ID, err)
-			return
-		}
-		if err := w.Flush(); err != nil {
+		wMsg := fmt.Sprintf("[CLIENT %v] Message N°%v\n", c.config.ID, msgID)
+
+		if err := writeFull(c.conn, []byte(wMsg)); err != nil {
 			log.Errorf("action: send | result: fail | client_id: %v | error: %v", c.config.ID, err)
 			return
 		}
