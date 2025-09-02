@@ -53,6 +53,7 @@ class Server:
         """
         try:
             self._winners = service.compute_winners()
+            self._raffle_done = True
             logging.info("action: sorteo | result: success")
         except Exception as e:
             logging.error("action: sorteo | result: fail | error: %s", e)
