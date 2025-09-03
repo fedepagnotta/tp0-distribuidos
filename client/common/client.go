@@ -169,7 +169,7 @@ func (c *Client) SendBets() {
 	}
 
 	if err == nil {
-		c.sendFinishedAndAskForWinners(ctx)
+		c.sendFinishedAndAskForWinners()
 	}
 	select {
 	case <-ctx.Done():
@@ -221,7 +221,7 @@ func readResponse(conn net.Conn, readDone chan struct{}) {
 // sendFinishedAndAskForWinners sends FINISHED (with the numeric agency ID)
 // and then REQUEST_WINNERS over the already open connection. It logs success
 // or failure for each write. On any serialization/I/O error it logs and returns.
-func (c *Client) sendFinishedAndAskForWinners(ctx context.Context) {
+func (c *Client) sendFinishedAndAskForWinners() {
 	agencyId, err := strconv.Atoi(c.config.ID)
 	if err != nil {
 		log.Errorf("action: send_finished | result: fail | error: %v", err)
