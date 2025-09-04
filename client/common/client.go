@@ -129,7 +129,7 @@ func (c *Client) createClientSocket() error {
 //  1. Opens the CSV and connects to the server.
 //  2. Starts a reader goroutine (readResponse) to consume server replies.
 //  3. Builds and streams batches (buildAndSendBatches) until EOF or cancellation.
-//  4. On success, sends FINISHED + REQUEST_WINNERS over the same connection.
+//  4. On success, sends FINISHED.
 //  5. Waits for either context cancellation or the reader goroutine to finish.
 //
 // It guarantees connection closure on exit and uses deadlines to unblock
@@ -169,7 +169,7 @@ func (c *Client) SendBets() {
 	}
 
 	if err == nil {
-		c.sendFinishedAndAskForWinners()
+		c.sendFinished()
 	}
 	select {
 	case <-ctx.Done():
@@ -218,10 +218,9 @@ func readResponse(conn net.Conn, readDone chan struct{}) {
 	}()
 }
 
-// sendFinishedAndAskForWinners sends FINISHED (with the numeric agency ID)
-// and then REQUEST_WINNERS over the already open connection. It logs success
-// or failure for each write. On any serialization/I/O error it logs and returns.
-func (c *Client) sendFinishedAndAskForWinners() {
+// sendFinishedAndAskForWinners sends FINISHED (with the numeric agency ID).
+// It logs success or failure for each write. On any serialization/I/O error it logs and returns.
+func (c *Client) sendFinished() {
 	agencyId, err := strconv.Atoi(c.config.ID)
 	if err != nil {
 		log.Errorf("action: send_finished | result: fail | error: %v", err)
