@@ -12,8 +12,7 @@ const NewBetsOpCode byte = 0
 const BetsRecvSuccessOpCode byte = 1
 const BetsRecvFailOpCode byte = 2
 const FinishedOpCode byte = 3
-const RequestWinnersOpCode byte = 4
-const WinnersOpCode byte = 5
+const WinnersOpCode byte = 4
 
 // ProtocolError models a framing/validation error while parsing or writing
 // protocol messages. Opcode, when present, indicates the message context.
@@ -52,30 +51,6 @@ func (msg *Finished) GetLength() int32 { return 4 }
 // WriteTo writes the FINISHED frame with little-endian length and agencyId.
 // It returns the total bytes written (1 + 4 + 4) or an error.
 func (msg *Finished) WriteTo(out io.Writer) (int32, error) {
-	if err := binary.Write(out, binary.LittleEndian, msg.GetOpCode()); err != nil {
-		return 0, err
-	}
-	if err := binary.Write(out, binary.LittleEndian, msg.GetLength()); err != nil {
-		return 0, err
-	}
-	if err := binary.Write(out, binary.LittleEndian, msg.AgencyId); err != nil {
-		return 0, err
-	}
-	return 5 + msg.GetLength(), nil
-}
-
-// RequestWinners is a client→server message that asks for the winners list
-// for a given agency. Body: [agencyId:i32].
-type RequestWinners struct {
-	AgencyId int32
-}
-
-func (msg *RequestWinners) GetOpCode() byte  { return RequestWinnersOpCode }
-func (msg *RequestWinners) GetLength() int32 { return 4 }
-
-// WriteTo writes the REQUEST_WINNERS frame with little-endian fields.
-// It returns the total bytes written (1 + 4 + 4) or an error.
-func (msg *RequestWinners) WriteTo(out io.Writer) (int32, error) {
 	if err := binary.Write(out, binary.LittleEndian, msg.GetOpCode()); err != nil {
 		return 0, err
 	}

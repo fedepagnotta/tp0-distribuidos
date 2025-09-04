@@ -235,13 +235,4 @@ func (c *Client) sendFinishedAndAskForWinners() {
 	}
 
 	log.Infof("action: send_finished | result: success | agencyId: %d", int32(agencyId))
-
-	reqMsg := RequestWinners{int32(agencyId)}
-
-	if _, err := reqMsg.WriteTo(c.conn); err != nil {
-		log.Errorf("action: send_request_winners | result: fail | error: %v", err)
-		return
-	}
-
-	log.Infof("action: send_request_winners | result: success | agencyId: %d", int32(agencyId))
 }
