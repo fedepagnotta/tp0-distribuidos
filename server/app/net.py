@@ -1,8 +1,26 @@
 import logging
 import signal
 import socket
+from collections import deque
+from enum import Enum, auto
+from typing import Deque, Tuple
 
 from app import protocol, service
+
+
+class HandleConnAction(Enum):
+    """Directive for how the caller should proceed with a client connection.
+
+    Values:
+      - CLOSE: stop handling this connection and close the socket now.
+      - EXIT:  stop reading, but don't close the socket (the server will reply
+               later, e.g., after FINISHED, and will close it at that time).
+      - KEEP:  keep the connection open and continue reading more messages.
+    """
+
+    CLOSE = auto()
+    EXIT = auto()
+    KEEP = auto()
 
 
 class Server:
@@ -20,7 +38,7 @@ class Server:
         self._server_socket.bind(("", port))
         self._server_socket.listen(listen_backlog)
         self._running = False
-        self._finished: set[int] = set()
+        self._finished: Deque[Tuple[int, socket.socket]] = deque()
         self._winners: dict[int, list[str]] = {}
         self._raffle_done: bool = False
         self._clients_amount = int(clients_amount)
@@ -70,27 +88,33 @@ class Server:
             logging.info(
                 "action: enviar_ganadores | result: success | agencia: %d", agency_id
             )
-        except protocol.ProtocolError as e:
+        except (protocol.ProtocolError, OSError) as e:
             logging.error(
                 "action: enviar_ganadores | result: fail | agencia: %d | error: %s",
                 agency_id,
                 e,
             )
 
-    def __process_msg(self, msg, client_sock: socket.socket) -> bool:
+    def __process_msg(self, msg, client_sock: socket.socket) -> HandleConnAction:
         """Route a decoded message and apply server semantics.
 
         Returns:
-          True  -> keep the connection open and keep reading
-          False -> stop handling this connection and close it
+          - HandleConnAction.KEEP  -> keep reading on this connection.
+          - HandleConnAction.CLOSE -> reply (if applicable) and close now.
+          - HandleConnAction.EXIT  -> stop reading but DO NOT close here
+                                      (socket is queued to be answered later).
 
         Semantics:
-        - NEW_BETS: persist all bets; on success reply BETS_RECV_SUCCESS
-          and log quantity; on error reply BETS_RECV_FAIL and log fail.
-        - FINISHED: record the agency_id; if all agencies have finished
-          and the raffle isn't done yet, trigger the raffle. Close (False).
-        - REQUEST_WINNERS: if raffle is done and the agency finished,
-          send winners. Close (False).
+          - NEW_BETS:
+              * Persist all bets; on success, send BETS_RECV_SUCCESS, log the
+                stored count, and return KEEP.
+              * On any error, send BETS_RECV_FAIL, log the failure, and return CLOSE.
+          - FINISHED:
+              * Enqueue (agency_id, socket). If all agencies have finished and the
+                raffle is not done, run the raffle and push WINNERS to every queued
+                socket (closing each).
+              * Return EXIT so the caller stops reading this connection without
+                closing it here (the socket will be closed after winners are sent).
         """
         if msg.opcode == protocol.Opcodes.NEW_BETS:
             try:
@@ -106,29 +130,32 @@ class Server:
                 logging.error(
                     "action: apuesta_recibida | result: fail | cantidad: %d", msg.amount
                 )
-                return True
+                return HandleConnAction.CLOSE
             logging.info(
                 "action: apuesta_recibida | result: success | cantidad: %d",
                 msg.amount,
             )
             protocol.BetsRecvSuccess().write_to(client_sock)
-            return True
+            return HandleConnAction.KEEP
+
         if msg.opcode == protocol.Opcodes.FINISHED:
-            self._finished.add(msg.agency_id)
+            self._finished.append((msg.agency_id, client_sock))
             if len(self._finished) == self._clients_amount and not self._raffle_done:
                 self.__raffle()
-            return False
-        if msg.opcode == protocol.Opcodes.REQUEST_WINNERS:
-            if self._raffle_done and msg.agency_id in self._finished:
-                self.__send_winners(msg.agency_id, client_sock)
-            return False
+                while self._finished:
+                    (ag_id, sock) = self._finished.popleft()
+                    self.__send_winners(ag_id, sock)
+                    sock.close()
+            return HandleConnAction.EXIT
 
     def __handle_client_connection(self, client_sock):
         """Handle a single client synchronously.
 
         Repeatedly receives a framed message (protocol.recv_msg), logs it,
-        and delegates to __process_msg. Closes the client socket at exit.
+        and delegates to __process_msg. Closes the client socket at exit if
+        __process_msg returns CLOSE action.
         """
+        curr_handle_conn_action = HandleConnAction.CLOSE
         while True:
             msg = None
             try:
@@ -139,7 +166,11 @@ class Server:
                     addr[0],
                     msg.opcode,
                 )
-                if not self.__process_msg(msg, client_sock):
+                curr_handle_conn_action = self.__process_msg(msg, client_sock)
+                if curr_handle_conn_action in (
+                    HandleConnAction.CLOSE,
+                    HandleConnAction.EXIT,
+                ):
                     break
             except protocol.ProtocolError as e:
                 logging.error("action: receive_message | result: fail | error: %s", e)
@@ -148,7 +179,8 @@ class Server:
             except OSError as e:
                 logging.error("action: send_message | result: fail | error: %s", e)
                 break
-        client_sock.close()
+        if curr_handle_conn_action == HandleConnAction.CLOSE:
+            client_sock.close()
 
     def __accept_new_connection(self):
         """Accept a new client connection.
@@ -169,3 +201,9 @@ class Server:
         """
         self._running = False
         self._server_socket.close()
+        while self._finished:
+            _ag, sock = self._finished.popleft()
+            try:
+                sock.close()
+            except OSError:
+                pass

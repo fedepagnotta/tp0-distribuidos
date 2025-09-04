@@ -19,8 +19,7 @@ class Opcodes:
     BETS_RECV_SUCCESS = 1
     BETS_RECV_FAIL = 2
     FINISHED = 3
-    REQUEST_WINNERS = 4
-    WINNERS = 5
+    WINNERS = 4
 
 
 class RawBet:
@@ -137,22 +136,6 @@ class Finished:
         self.agency_id = agency_id
 
 
-class RequestWinners:
-    """Inbound REQUEST_WINNERS message. Body is a single agency_id (i32 LE)."""
-
-    def __init__(self):
-        self.opcode = Opcodes.REQUEST_WINNERS
-        self.agency_id = None
-        self._length = 4
-
-    def read_from(self, sock: socket.socket, length: int):
-        """Validate fixed body length (4) and read agency_id."""
-        if length != self._length:
-            raise ProtocolError("invalid length", self.opcode)
-        (agency_id, _) = read_i32(sock, length, self.opcode)
-        self.agency_id = agency_id
-
-
 def recv_exactly(sock: socket.socket, n: int) -> bytes:
     """Read exactly n bytes (retrying as needed) or raise EOFError on peer close.
 
@@ -230,10 +213,6 @@ def recv_msg(sock: socket.socket):
         return msg
     if opcode == Opcodes.FINISHED:
         msg = Finished()
-        msg.read_from(sock, length)
-        return msg
-    if opcode == Opcodes.REQUEST_WINNERS:
-        msg = RequestWinners()
         msg.read_from(sock, length)
         return msg
     raise ProtocolError(f"invalid opcode: {opcode}")
