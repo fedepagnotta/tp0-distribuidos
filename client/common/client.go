@@ -125,14 +125,15 @@ func (c *Client) createClientSocket() error {
 	return nil
 }
 
-// SendBets drives the client lifecycle for sending batches.
-// - Installs a SIGTERM-aware context for graceful cancellation.
-// - Opens the CSV, connects once, and starts:
-//   - writer goroutine: buildAndSendBatches(ctx, betsReader)
-//   - reader goroutine: readResponse(conn, readDone) for batch acks
-//   - Waits for the writer; on success, triggers sendFinishedAndAskForWinners(ctx).
-//   - On cancellation, sets a short read deadline to unblock the reader and exits.
-//     Otherwise, waits for the reader to finish and half-closes the write side.
+// SendBets is the high-level entry point. It:
+//  1. Opens the CSV and connects to the server.
+//  2. Starts a reader goroutine (readResponse) to consume server replies.
+//  3. Builds and streams batches (buildAndSendBatches) until EOF or cancellation.
+//  4. On success, sends FINISHED over the same connection.
+//  5. Waits for either context cancellation or the reader goroutine to finish.
+//
+// It guarantees connection closure on exit and uses deadlines to unblock
+// the reader goroutine on cancellation.
 func (c *Client) SendBets() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
@@ -168,9 +169,8 @@ func (c *Client) SendBets() {
 	}
 
 	if err == nil {
-		c.sendFinishedAndAskForWinners(ctx)
+		c.sendFinished()
 	}
-
 	select {
 	case <-ctx.Done():
 		_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -183,13 +183,16 @@ func (c *Client) SendBets() {
 	}
 }
 
-// readResponse consumes server responses on a dedicated goroutine.
-//   - Decodes framed replies from conn and logs success/failure per batch.
-//   - Stops on I/O error or EOF, then closes readDone to signal completion.
-//     (WINNERS is not handled here; it is retrieved separately.)
+// readResponse consumes server responses from conn in a dedicated goroutine.
+// It logs per-message results and terminates when:
+//   - an I/O error occurs (EOF included), or
+//   - a Winners message is received (explicit break to stop reading).
+//
+// The function closes readDone when the goroutine exits.
 func readResponse(conn net.Conn, readDone chan struct{}) {
 	reader := bufio.NewReader(conn)
 	go func() {
+	readLoop:
 		for {
 			msg, err := ReadMessage(reader)
 			if err != nil {
@@ -203,18 +206,21 @@ func readResponse(conn net.Conn, readDone chan struct{}) {
 				log.Info("action: bets_enviadas | result: success")
 			case BetsRecvFailOpCode:
 				log.Error("action: bets_enviadas | result: fail")
+			case WinnersOpCode:
+				{
+					log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d",
+						len(msg.(*Winners).List))
+					break readLoop
+				}
 			}
 		}
 		close(readDone)
 	}()
 }
 
-// sendFinishedAndAskForWinners finalizes the upload and fetches winners.
-//   - Sends FINISHED (agency id) on the current connection.
-//   - Then, in a retry loop, opens short-lived connections to send REQUEST_WINNERS,
-//     reads a single reply, and stops when a WINNERS message arrives.
-//   - Honors ctx cancellation between retries; logs each attempt and error.
-func (c *Client) sendFinishedAndAskForWinners(ctx context.Context) {
+// sendFinishedAndAskForWinners sends FINISHED (with the numeric agency ID).
+// It logs success or failure for each write. On any serialization/I/O error it logs and returns.
+func (c *Client) sendFinished() {
 	agencyId, err := strconv.Atoi(c.config.ID)
 	if err != nil {
 		log.Errorf("action: send_finished | result: fail | error: %v", err)
@@ -228,39 +234,4 @@ func (c *Client) sendFinishedAndAskForWinners(ctx context.Context) {
 	}
 
 	log.Infof("action: send_finished | result: success | agencyId: %d", int32(agencyId))
-
-	for {
-		if err := c.createClientSocket(); err != nil {
-			return
-		}
-		conn := c.conn
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-
-		reqMsg := RequestWinners{int32(agencyId)}
-		if _, err := reqMsg.WriteTo(conn); err != nil {
-			conn.Close()
-			log.Errorf("action: send_request_winners | result: fail | error: %v", err)
-			return
-		}
-		log.Infof("action: send_request_winners | result: success | agencyId: %d", int32(agencyId))
-
-		reader := bufio.NewReader(conn)
-		msg, err := ReadMessage(reader)
-		conn.Close()
-
-		if err == nil && msg.GetOpCode() == WinnersOpCode {
-			log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d",
-				len(msg.(*Winners).List))
-			break
-		}
-		if errors.Is(err, io.EOF) {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(500 * time.Millisecond):
-			}
-			continue
-		}
-		log.Errorf("action: leer_respuesta | result: fail | err: %v", err)
-	}
 }
