@@ -29,9 +29,8 @@ class Server:
 
         Binds and listens on the given port. Tracks:
         - _running: main-loop flag toggled by SIGTERM handler.
-        - _finished: set of agency_ids that already sent FINISHED.
+        - _finished: queue of agencies (id and connection) that already sent FINISHED.
         - _winners: winners grouped by agency after the raffle.
-        - _raffle_done: whether the raffle was already computed.
         - _clients_amount: total agencies expected to finish.
         """
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -40,7 +39,6 @@ class Server:
         self._running = False
         self._finished: Deque[Tuple[int, socket.socket]] = deque()
         self._winners: dict[int, list[str]] = {}
-        self._raffle_done: bool = False
         self._clients_amount = int(clients_amount)
 
     def run(self):
@@ -71,7 +69,6 @@ class Server:
         """
         try:
             self._winners = service.compute_winners()
-            self._raffle_done = True
             logging.info("action: sorteo | result: success")
         except Exception as e:
             logging.error("action: sorteo | result: fail | error: %s", e)
@@ -140,7 +137,7 @@ class Server:
 
         if msg.opcode == protocol.Opcodes.FINISHED:
             self._finished.append((msg.agency_id, client_sock))
-            if len(self._finished) == self._clients_amount and not self._raffle_done:
+            if len(self._finished) == self._clients_amount:
                 self.__raffle()
                 while self._finished:
                     (ag_id, sock) = self._finished.popleft()
