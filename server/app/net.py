@@ -112,9 +112,7 @@ class Server:
           BETS_RECV_FAIL and log 'apuesta_recibida | fail | cantidad'.
         - FINISHED: wait on the `_finished` Barrier. The last thread crossing
           the barrier triggers the raffle (under `_raffle_lock`) if not done.
-          Keep the connection open (return True).
-        - REQUEST_WINNERS: wait until `_raffle_done` is set, then send the
-          agency's winners and close the connection (return False).
+          Once the raffle is done, send the agency's winners.
         """
         if msg.opcode == protocol.Opcodes.NEW_BETS:
             try:
@@ -143,9 +141,6 @@ class Server:
             with self._raffle_lock:
                 if not self._raffle_done.is_set():
                     self.__raffle()
-            return True
-        if msg.opcode == protocol.Opcodes.REQUEST_WINNERS:
-            self._raffle_done.wait()
             self.__send_winners(msg.agency_id, client_sock)
             return False
 
