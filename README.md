@@ -686,16 +686,12 @@ El servidor se organiza en tres módulos:
 
 Se agrega una nueva notación para describir el formato del body: \[string list], que consta de un n \[int] seguido de n \[string].
 
-Se agregan tres mensajes nuevos:
+Se agregan dos mensajes nuevos:
 
-- `FINISHED`, con opcode **3**, que utilizará el cliente para avisar al servidor que terminó con la entrega de todos los batches. El body es un \[int] que contendrá el ID de la agencia.
-- `REQUEST_WINNERS`, con opcode **4**, que utilizará el cliente para solicitar los ganadores correspondientes a su agencia. El body es un \[int]
-  que contendrá el ID de la agencia.
-- `WINNERS`, con opcode **5**, que utilizará el server para notificar los ganadores correspondientes a cada agencia. El body es un \[string list],
+- `FINISHED`, con opcode **3**, que utilizará el cliente para avisar al servidor que terminó con la entrega de todos los batches, solicitando
+  los ganadores al mismo tiempo. El body es un \[int] que contendrá el ID de la agencia.
+- `WINNERS`, con opcode **4**, que utilizará el server para notificar los ganadores correspondientes a cada agencia. El body es un \[string list],
   que contendrá los DNI de todos los ganadores.
-
-Para proteger al servido de clientes maliciosos, si el servidor recibe un `REQUEST_WINNERS` de un cliente que no había enviado `FINISH` anteriormente,
-directamente cierra la conexión.
 
 ---
 
@@ -711,40 +707,8 @@ _, _ = finishedMsg.WriteTo(c.conn)
 log.Infof("action: send_finished | result: success | agencyId: %d", int32(agencyId))
 ```
 
-**2) Consulta de ganadores con reconexión breve (polling)**
-La consulta se realiza con **conexiones cortas**: para cada intento se abre una conexión nueva, se envía `REQUEST_WINNERS(agencyId)`, se fija un `ReadDeadline` de 2s, se lee **una** respuesta y se cierra.
-Si el servidor aún no puede responder (cierre → `io.EOF`), el cliente espera 500 ms y reintenta; al recibir `WINNERS`, registra la cantidad y finaliza:
-
-```go
-for {
-    _ = c.createClientSocket()
-    conn := c.conn
-    _ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-
-    req := RequestWinners{int32(agencyId)}
-    _, _ = req.WriteTo(conn)
-    log.Infof("action: send_request_winners | result: success | agencyId: %d", int32(agencyId))
-
-    reader := bufio.NewReader(conn)
-    msg, err := ReadMessage(reader)
-    conn.Close()
-
-    if err == nil && msg.GetOpCode() == WinnersOpCode {
-        log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d",
-            len(msg.(*Winners).List))
-        break
-    }
-    if errors.Is(err, io.EOF) {
-        select {
-        case <-ctx.Done():
-            return
-        case <-time.After(500 * time.Millisecond):
-        }
-        continue
-    }
-    log.Errorf("action: leer_respuesta | result: fail | err: %v", err)
-}
-```
+Si el servidor todavía no realizó el sorteo, encola el socket del cliente junto con el id de la agencia, de manera que el cliente queda esperando a
+los ganadores.
 
 **3) Lectura estricta de `WINNERS` (evitando short reads)**
 El cliente valida la longitud del body y cada string con un contador `remaining`, y usa `io.ReadFull` para garantizar lecturas completas:
@@ -776,19 +740,23 @@ func (msg *Winners) readFrom(reader *bufio.Reader) error {
 
 **4) E/S confiable e interrupción ordenada**
 
-- **Escrituras**: `io.Copy` en los envíos de body y `binary.Write` para campos fijos sobre el `net.Conn` (que internamente pueden fragmentarse) junto con cierres explícitos de conexión por intento mitigan _short writes_.
+- **Escrituras**: `io.Copy` en los envíos de body y `binary.Write` para campos fijos sobre el `net.Conn` (que internamente pueden fragmentarse) junto con cierres
+  explícitos de conexión por intento mitigan _short writes_.
 - **Lecturas**: `io.ReadFull` asegura consumir exactamente `strLen` bytes por string.
-- **Señales**: el `context` derivado de `signal.NotifyContext` permite abortar el polling con tiempos de espera acotados.
 
 ---
 
 #### Server
 
 **1) Estado y flujo secuencial**
-El servidor mantiene `_finished` (agencias que enviaron `FINISH`), `_raffle_done` (sorteo realizado) y `_winners` (DNIs ganadores por agencia). La atención es **secuencial** por conexión: cada socket procesa mensajes hasta que un `FINISH` o un `REQUEST_WINNERS` obliga a **cerrar** esa conexión.
+El servidor mantiene `_finished` (agencias que enviaron `FINISH`), `_raffle_done` (sorteo realizado) y `_winners` (DNIs ganadores por agencia).
+La atención es **secuencial**: cada socket procesa mensajes del cliente hasta que éste envía `FINISHED`. Si todavía faltan apuestas de otras agencias,
+se encola esa conexión y se pasa a aceptar otro cliente. Una vez que todos enviaron `FINISHED`, se comienzan a desencolar los clientes y se le envían
+los ganadores correspondientes a su agencia, cerrando la conexión en el momento.
 
 **2) Recepción de apuestas y ACK**
-Al recibir `NEW_BETS`, se validan y almacenan las apuestas. Luego se responde `BETS_RECV_SUCCESS` y se sigue leyendo en la misma conexión (hasta el `FINISH`). La deserialización usa un `recv_exactly` que evita _short reads_:
+Al recibir `NEW_BETS`, se validan y almacenan las apuestas. Luego se responde `BETS_RECV_SUCCESS` y se sigue leyendo en la misma conexión (hasta el `FINISHED`).
+La deserialización usa un `recv_exactly` que evita _short reads_:
 
 ```python
 def recv_exactly(sock: socket.socket, n: int) -> bytes:
@@ -801,22 +769,27 @@ def recv_exactly(sock: socket.socket, n: int) -> bytes:
 ```
 
 **3) Coordinación de sorteo**
-El sorteo se dispara **una sola vez** cuando se reciben los `FINISH` de todas las agencias y se agrupan ganadores por agencia:
+El sorteo se dispara **una sola vez** cuando se reciben los `FINISHED` de todas las agencias y se agrupan ganadores por agencia:
 
 ```python
 def __raffle(self):
-    bets = utils.load_bets()
-    winners = [(b.agency, b.document) for b in bets if utils.has_won(b)]
-    for agency, doc in winners:
-        self._winners.setdefault(agency, []).append(doc)
-    logging.info("action: sorteo | result: success")
-    self._raffle_done = True
+    """Compute winners once all agencies finished.
+
+    Delegates to service.compute_winners() and stores the result.
+    Logs success/failure. Intended to run exactly once.
+    """
+    try:
+        self._winners = service.compute_winners()
+        self._raffle_done = True
+        logging.info("action: sorteo | result: success")
+    except Exception as e:
+        logging.error("action: sorteo | result: fail | error: %s", e)
+        return
 ```
 
-**4) Atención de `REQUEST_WINNERS` y cierre temprano**
+**4) Envío de `WINNERS` y cierre temprano**
 
 - Si el sorteo está listo y la agencia figura en `_finished`, se envía `WINNERS` y se cierra la conexión.
-- Si llega un `REQUEST_WINNERS` **antes** de que esa agencia haya enviado `FINISH` o antes del sorteo global, el servidor **cierra la conexión** sin responder, cumpliendo la política anti-abuso.
 
 La construcción del mensaje `WINNERS` usa `sendall` para evitar _short writes_:
 
