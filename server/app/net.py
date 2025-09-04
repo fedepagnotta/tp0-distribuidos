@@ -149,7 +149,7 @@ class Server:
 
         Calls `service.compute_winners()` (pure domain logic), stores the result
         into `_winners`, logs success, and sets `_raffle_done` so any waiting
-        REQUEST_WINNERS handlers can proceed.
+        FINISHED handlers can proceed.
         """
         try:
             self._winners = service.compute_winners()
