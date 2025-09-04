@@ -967,10 +967,46 @@ func (msg *Winners) readFrom(reader *bufio.Reader) error {
 #### Server
 
 **1) Estado y flujo secuencial**
-El servidor mantiene `_finished` (agencias que enviaron `FINISH`), `_raffle_done` (sorteo realizado) y `_winners` (DNIs ganadores por agencia).
+El servidor mantiene `_finished` (una cola con las agencias que enviaron `FINISH` y sus sockets), `_raffle_done` (sorteo realizado)
+y `_winners` (DNIs ganadores por agencia).
 La atención es **secuencial**: cada socket procesa mensajes del cliente hasta que éste envía `FINISHED`. Si todavía faltan apuestas de otras agencias,
 se encola esa conexión y se pasa a aceptar otro cliente. Una vez que todos enviaron `FINISHED`, se comienzan a desencolar los clientes y se le envían
 los ganadores correspondientes a su agencia, cerrando la conexión en el momento.
+
+```python
+def __process_msg(self, msg, client_sock: socket.socket) -> HandleConnAction:
+    if msg.opcode == protocol.Opcodes.NEW_BETS:
+        try:
+            service.store_bets(msg.bets)
+            for bet in msg.bets:
+                logging.info(
+                    "action: apuesta_almacenada | result: success | dni: %s | numero: %s",
+                    bet.document,
+                    bet.number,
+                )
+        except Exception as e:
+            protocol.BetsRecvFail().write_to(client_sock)
+            logging.error(
+                "action: apuesta_recibida | result: fail | cantidad: %d", msg.amount
+            )
+            return HandleConnAction.CLOSE # indica que la conexión debe cerrarse
+        logging.info(
+            "action: apuesta_recibida | result: success | cantidad: %d",
+            msg.amount,
+        )
+        protocol.BetsRecvSuccess().write_to(client_sock)
+        return HandleConnAction.KEEP # indica que la conexión no debe cerrarse
+
+    if msg.opcode == protocol.Opcodes.FINISHED:
+        self._finished.append((msg.agency_id, client_sock)) # encolar conexion
+        if len(self._finished) == self._clients_amount:
+            self.__raffle() # terminó el último cliente -> sorteo
+            while self._finished:
+                (ag_id, sock) = self._finished.popleft()
+                self.__send_winners(ag_id, sock) # desencolo cliente y envío `WINNERS` con DNIs de su agencia
+                sock.close()
+        return HandleConnAction.EXIT # indica que no debe continuarse la comunicación con el cliente, pero no debe cerrarse la conexión
+```
 
 **2) Recepción de apuestas y ACK**
 Al recibir `NEW_BETS`, se validan y almacenan las apuestas. Luego se responde `BETS_RECV_SUCCESS` y se sigue leyendo en la misma conexión (hasta el `FINISHED`).
@@ -1027,6 +1063,27 @@ class Winners:
 **5) Cantidad de agencias**
 La cantidad de agencias es configurable en el script `generar-compose.sh`, ya que se pasa el segundo parámetro del mismo como variable de entorno al servicio del server,
 que utiliza esta variable para saber cuántos mensajes `Finished` debe esperar para hacer el sorteo.
+
+**6) Graceful Shutdown**
+
+En el handler de `SIGTERM` se desencolan los sockets que habían sido encolados y se cierran esas conexiones, para liberar los recursos correctamente.
+
+```python
+def __stop_running(self, _signum, _frame):
+    """SIGTERM handler.
+
+    Marks the server as stopping and closes the listening socket
+    to wake up accept().
+    """
+    self._running = False
+    self._server_socket.close()
+    while self._finished:
+        _ag, sock = self._finished.popleft()
+        try:
+            sock.close()
+        except OSError:
+            pass
+```
 
 ### Ejercicio N°8
 
