@@ -1153,7 +1153,7 @@ El servidor atiende **múltiples conexiones en paralelo** (un hilo por cliente) 
 
 - `threading.Barrier(5)` → asegura que el sorteo ocurra **solo** cuando **todas** las agencias enviaron `FINISHED`.
 - `threading.Lock` (`_raffle_lock`, `_storage_lock`) → protege **sorteo único** y **persistencia** contra carreras.
-- Un hilo por conexión → simplicidad; el servidor escala bien para el **I/O-bound** del problema.
+- Un hilo por conexión → simplicidad; el servidor escala bien para el **I/O-bound** del problema con la poca cantidad de clientes que se manejan.
 
 Manejo de cierre: `SIGTERM` → se setea `_stop`, se cierra el listener para despertar `accept()`, se **joinean** los workers y se hace `logging.shutdown()`.
 
@@ -1241,3 +1241,57 @@ suficiente y clara para **5 agencias**. **Overhead** también menor (crear threa
 
 Con este diseño, el sistema logra: **concurrencia** de conexiones, **estado global consistente**, **sorteo único** garantizado, y
 **contrato de protocolo** estricto (framing, validaciones y logs requeridos).
+
+## Apéndice
+
+### Falta de política de reintentos / timeouts de conexión
+
+Para mantener una solución relativamente simple y asegurar una implementación correcta en poco tiempo, se decidió priorizar el _happy path_ y presuponer
+un correcto comportamiento del cliente, tal como fue implementado. Debido a eso, no se agregaron timeouts del servidor en caso de que el
+cliente tardara demasiado entre batch y batch de bets, y en consecuencia tampoco se esgrimió una política de reintentos por parte del cliente en caso de
+desconexión/error del servidor.
+Aunque esto no es lo ideal, se consideró que no supone un problema demasiado crítico para el correcto funcionamiento del servidor y de la solución en general.
+Además, dado que se utilizan threads, no es tan costoso en términos de memoria tener algunos threads ociosos en espera de respuestas, como sí lo sería en un
+esquema multiprocessing. En cuanto al servidor secuencial del ejercicio 7, se mantendrían sockets abiertos durante mucho tiempo, algo que, aunque inconveniente,
+tampoco invalida la solución.
+Por último, dado que el enunciado estipula que los ganadores deben enviarse una vez que las apuestas de todos los clientes fueron recibidas y el sorteo realizado,
+se implementen timeouts o no, los clientes deberán esperar la misma cantidad de tiempo en caso de que otro cliente tarde un tiempo excesivo en enviar sus bets.
+
+### Errores encontrados y posible solución
+
+No se agrega un finally al método `run` del `Server` en caso de OSError no asociado a un `SIGTERM`, haciendo que en ese caso los threads no se joineen.
+Para resolverlo, habría que actualizar la función `run`, encapsulando al join de los threads en un bloque `finally`:
+
+```python
+def run(self):
+    """Main server loop.
+
+    Installs SIGTERM handler, accepts connections until `_stop` is set,
+    and spawns one worker thread per client. On shutdown:
+    - breaks the accept loop if the listening socket is closed,
+    - joins all worker threads,
+    - and calls `logging.shutdown()` to flush logs.
+    """
+    signal.signal(signal.SIGTERM, self.__handle_sigterm)
+    try:
+        while not self._stop.is_set():
+            try:
+                client_sock = self.__accept_new_connection()
+                t = threading.Thread(
+                    target=self.__handle_client_connection, args=(client_sock,)
+                )
+                self._threads.append(t)
+                t.start()
+            except OSError:
+                if self._stop.is_set():
+                    break
+                raise
+    finally: # debería agregarse un finally para que se ejecute siempre
+        for t in self._threads:
+            t.join()
+        logging.shutdown()
+```
+
+Por otro lado, en el `handle_sigterm` no se cierran los sockets de los threads, generando la posibilidad de que un thread quede bloqueado indefinidamente
+o durante un tiempo excesivamente largo en espera de un mensaje de un cliente que dejó de comunicarse. Para mitigar este riesgo, lo mejor sería guardar
+los threads con sus respectivos sockets, e iterar esa lista en el `handle_sigterm`, forzando el cierre de los sockets de cada uno.
